@@ -1,0 +1,20 @@
+[package]
+name = "rgba"
+version = "0.1.0"
+authors = ["mjhd <mjhd.devlion@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.41"
+num-traits = "0.2.14"
+num-derive = "0.3.3"
+bitmatch = "0.1.1"
+pixels = "0.4.0"
+winit = "0.25.0"
+winit_input_helper = "0.10.0"
+image = "0.23.14"
+bitfield = "0.13.2"
+env_logger = "0.8.4"
+log = "0.4.14"
