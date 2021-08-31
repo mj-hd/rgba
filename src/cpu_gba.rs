@@ -25,6 +25,7 @@ pub enum Registers {
     R12,
     SP,
     LR,
+    PC,
 }
 
 impl From<u32> for Registers {
@@ -243,6 +244,7 @@ impl R {
             Registers::R12 => self.fiq_r[4].get(mode),
             Registers::SP => self.mode_r[0].get(mode),
             Registers::LR => self.mode_r[1].get(mode),
+            Registers::PC => self.pc,
         }
     }
 
@@ -265,6 +267,9 @@ impl R {
             Registers::R12 => self.fiq_r[4].set(mode, val),
             Registers::SP => self.mode_r[0].set(mode, val),
             Registers::LR => self.mode_r[1].set(mode, val),
+            Registers::PC => {
+                self.pc = val;
+            }
         }
     }
 
@@ -430,6 +435,20 @@ impl Cpu {
         }
     }
 
+    fn low_registers(&self, rlist: u8) -> Vec<Registers> {
+        let registers = vec![];
+
+        for r in 0u8..8u8 {
+            if rlist & (1 << r) == 0 {
+                continue;
+            }
+
+            registers.push(Registers::from(r));
+        }
+
+        registers
+    }
+
     #[bitmatch]
     pub fn do_mnemonic(&mut self, opecode: u32) -> Result<()> {
         #[bitmatch]
@@ -444,10 +463,10 @@ impl Cpu {
             "cccc0001_00101111_11111111_0001rrrr" if self.guard(c) => self.bx(Registers::from(r)),
 
             // SWI
-            "cccc1111_nnnnnnnn_nnnnnnnn_nnnnnnnn" if self.guard(c) => self.swi(n),
+            "cccc1111_????????_????????_????????" if self.guard(c) => self.swi(),
 
             // BKPT
-            "cccc0001_0010nnnn_nnnnnnnn_0111mmmm" if self.guard(c) => self.bkpt(n << 12 | m),
+            "cccc0001_0010????_????????_0111????" if self.guard(c) => self.bkpt(),
 
             // UND
             "cccc011?_????????_????????_???1????" if self.guard(c) => self.und(),
@@ -939,6 +958,64 @@ impl Cpu {
                 Ok(())
             }
 
+            // push/pop registers
+            "1011o10s_nnnnnnnn" => {
+                let mut registers = self.low_registers(n as u8);
+
+                match o {
+                    // PUSH
+                    0b0 => {
+                        if s == 1 {
+                            registers.push(Registers::LR);
+                        }
+
+                        self.thumb_push(registers)
+                    }
+                    // POP
+                    0b1 => {
+                        if s == 1 {
+                            registers.push(Registers::PC);
+                        }
+
+                        self.thumb_pop(registers)
+                    }
+                    _ => bail!("invalid push pop registers opcode"),
+                }
+            }
+
+            // multiple load/store
+            "1100obbb_nnnnnnnn" => {
+                let rb = Registers::from(b);
+                let registers = self.low_registers(n as u8);
+
+                match o {
+                    // STMIA
+                    0b0 => self.thumb_stmia(rb, registers),
+                    // LDMIA
+                    0b1 => self.thumb_ldmia(rb, registers),
+                    _ => bail!("invalid mutiple load store opecode"),
+                }
+            }
+
+            // conditional branch
+            "1101oooo_nnnnnnnn" => {
+                // TODO
+            }
+
+            // unconditional branch
+            "11100nnn_nnnnnnnn" => {
+                // TODO
+            }
+
+            // TODO: long branch with link
+
+            // software interrupt and breakpoint
+            // SWI
+            "11011111_????????" => self.swi(),
+
+            // BKPT
+            "10111110_????????" => self.bkpt(),
+
             _ => bail!("invalid thumb opecode"),
         }
     }
@@ -968,11 +1045,11 @@ impl Cpu {
         Ok(())
     }
 
-    fn swi(&mut self, _: u32) -> Result<()> {
+    fn swi(&mut self) -> Result<()> {
         unimplemented!("SWI");
     }
 
-    fn bkpt(&mut self, _: u32) -> Result<()> {
+    fn bkpt(&mut self) -> Result<()> {
         unimplemented!("BKPT");
     }
 
@@ -1927,6 +2004,58 @@ impl Cpu {
 
         self.r.set(rd, result as u32);
         self.r.cpsr.set_nz_by(result);
+
+        Ok(())
+    }
+
+    fn thumb_push(&mut self, registers: Vec<Registers>) -> Result<()> {
+        let mut addr = self.r.get(Registers::SP);
+
+        for r in registers {
+            let val = self.r.get(r);
+
+            addr = addr.wrapping_sub(4);
+
+            self.bus.write_32(addr, val)?;
+        }
+
+        self.r.set(Registers::SP, addr);
+
+        Ok(())
+    }
+
+    fn thumb_pop(&mut self, registers: Vec<Registers>) -> Result<()> {
+        self.thumb_ldmia(Registers::SP, registers)
+    }
+
+    fn thumb_stmia(&mut self, rb: Registers, registers: Vec<Registers>) -> Result<()> {
+        let mut addr = self.r.get(rb);
+
+        for r in registers {
+            let val = self.r.get(r);
+
+            self.bus.write_32(addr, val)?;
+
+            addr = addr.wrapping_add(4);
+        }
+
+        self.r.set(rb, addr);
+
+        Ok(())
+    }
+
+    fn thumb_ldmia(&mut self, rb: Registers, registers: Vec<Registers>) -> Result<()> {
+        let mut addr = self.r.get(rb);
+
+        for r in registers {
+            let val = self.bus.read_32(addr)?;
+
+            self.r.set(r, val);
+
+            addr = addr.wrapping_add(4);
+        }
+
+        self.r.set(rb, addr);
 
         Ok(())
     }
