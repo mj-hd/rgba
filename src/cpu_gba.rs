@@ -1,4 +1,4 @@
-use crate::{arit::IsOverflowAdd, arit::IsOverflowSub, bus::Bus};
+use crate::{arit::IntoI10, arit::IsOverflowAdd, arit::IsOverflowSub, bus::Bus};
 use anyhow::{bail, Result};
 use bitfield::bitfield;
 use bitmatch::bitmatch;
@@ -215,7 +215,7 @@ where
 
 #[derive(Default)]
 pub struct R {
-    common_r: [CommonRegister; 7],
+    common_r: [CommonRegister; 8],
     fiq_r: [FiqRegister; 5],
     mode_r: [ModeRegister; 2],
 
@@ -351,11 +351,19 @@ impl Cpu {
             return Ok(());
         }
 
-        let opecode = self.bus.read_32(self.r.pc)?;
+        if self.r.cpsr.t() {
+            let opecode = self.bus.read_16(self.r.pc)?;
 
-        self.r.pc = self.r.pc.wrapping_add(4);
+            self.r.pc = self.r.pc.wrapping_add(2);
 
-        self.do_mnemonic(opecode)?;
+            self.do_mnemonic_thumb(opecode)?;
+        } else {
+            let opecode = self.bus.read_32(self.r.pc)?;
+
+            self.r.pc = self.r.pc.wrapping_add(4);
+
+            self.do_mnemonic(opecode)?;
+        }
 
         Ok(())
     }
@@ -436,7 +444,7 @@ impl Cpu {
     }
 
     fn low_registers(&self, rlist: u8) -> Vec<Registers> {
-        let registers = vec![];
+        let mut registers = vec![];
 
         for r in 0u8..8u8 {
             if rlist & (1 << r) == 0 {
@@ -999,15 +1007,23 @@ impl Cpu {
 
             // conditional branch
             "1101oooo_nnnnnnnn" => {
-                // TODO
+                if self.guard(o as u32) {
+                    self.thumb_branch(n as i8 as i16)
+                } else {
+                    Ok(())
+                }
             }
 
             // unconditional branch
-            "11100nnn_nnnnnnnn" => {
-                // TODO
-            }
+            "11100nnn_nnnnnnnn" => self.thumb_branch(n.into_i10()),
 
-            // TODO: long branch with link
+            // long branch with link
+            // first
+            "11110nnn_nnnnnnnn" => self.thumb_long_branch_first(n.into_i10()),
+
+            // Second Instruction
+            // BX
+            "11111nnn_nnnnnnnn" => self.thumb_long_branch_second(n.into_i10()),
 
             // software interrupt and breakpoint
             // SWI
@@ -1716,23 +1732,6 @@ impl Cpu {
         Ok(())
     }
 
-    fn thumb_move_shift(
-        &mut self,
-        opecode: u16,
-        offset: u16,
-        rs: Registers,
-        rd: Registers,
-    ) -> Result<()> {
-        match opecode {
-            0b00 => self.thumb_lsl(rs, rd, offset)?,
-            0b01 => self.thumb_lsr(rs, rd, offset)?,
-            0b10 => self.thumb_asr(rs, rd, offset)?,
-            _ => bail!("invalid thumb move shift"),
-        }
-
-        Ok(())
-    }
-
     fn thumb_lsl(&mut self, rs: Registers, rd: Registers, offset: u16) -> Result<()> {
         let source = self.r.get(rs) as u16;
 
@@ -2056,6 +2055,37 @@ impl Cpu {
         }
 
         self.r.set(rb, addr);
+
+        Ok(())
+    }
+
+    fn thumb_branch(&mut self, offset: i16) -> Result<()> {
+        let base_addr = self.r.pc;
+        let offset = (offset as i32) << 1;
+        let addr = (base_addr as i32).wrapping_add(offset) as u32;
+
+        self.r.pc = addr;
+
+        Ok(())
+    }
+
+    fn thumb_long_branch_first(&mut self, offset: i16) -> Result<()> {
+        let base_addr = self.r.pc;
+        let offset = (offset as i32) << 12;
+        let addr = (base_addr as i32).wrapping_add(offset) as u32;
+
+        self.r.set(Registers::LR, addr);
+
+        Ok(())
+    }
+
+    fn thumb_long_branch_second(&mut self, offset: i16) -> Result<()> {
+        let base_addr = self.r.get(Registers::LR);
+        let offset = (offset as i32) << 1;
+        let addr = (base_addr as i32).wrapping_add(offset) as u32;
+
+        self.r.pc = addr;
+        self.r.cpsr.set_t(addr & 1 == 1);
 
         Ok(())
     }

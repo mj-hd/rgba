@@ -77,3 +77,19 @@ impl IsOverflowSub for u8 {
         (!s1 && s2 && s3) || (s1 && !s2 && !s3)
     }
 }
+
+pub trait IntoI10 {
+    fn into_i10(&self) -> i16;
+}
+
+impl IntoI10 for u16 {
+    fn into_i10(&self) -> i16 {
+        let mut result = self & 0x3FF;
+
+        if self & 0x0400 == 1 {
+            result |= 0xFC00;
+        }
+
+        result as i16
+    }
+}
