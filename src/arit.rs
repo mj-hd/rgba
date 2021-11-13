@@ -93,3 +93,19 @@ impl IntoI10 for u16 {
         result as i16
     }
 }
+
+pub trait IntoI24 {
+    fn into_i24(&self) -> i32;
+}
+
+impl IntoI24 for u32 {
+    fn into_i24(&self) -> i32 {
+        let mut result = self & 0x00FF_FFFF;
+
+        if self & 0x0080_0000 > 0 {
+            result |= 0xFF00_0000;
+        }
+
+        result as i32
+    }
+}

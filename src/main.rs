@@ -1,11 +1,13 @@
 use env_logger::{Builder, Target};
 use log::debug;
 use pixels::{Pixels, SurfaceTexture};
-use rgba::rom::Rom;
+use rgba::{gba::Gba, rom::Rom};
 use std::{
     env,
     fs::File,
     io::BufReader,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 use winit::{
@@ -15,6 +17,10 @@ use winit::{
     window::WindowBuilder,
 };
 use winit_input_helper::WinitInputHelper;
+
+enum UiThreadEvent {
+    Render(Vec<u8>),
+}
 
 fn main() {
     let mut builder = Builder::from_default_env();
@@ -44,9 +50,41 @@ fn main() {
 
     debug!("ROM: {:?}", rom);
 
+    let (ui_sender, ui_receiver) = mpsc::sync_channel::<UiThreadEvent>(1);
+
+    {
+        thread::spawn(move || {
+            let mut gba = Gba::new(rom);
+
+            gba.reset().unwrap();
+
+            loop {
+                let time = Instant::now();
+
+                for _ in 0..17595106 {
+                    gba.tick().unwrap();
+                }
+
+                let buffer = gba.render().unwrap();
+
+                let _ = ui_sender.try_send(UiThreadEvent::Render(buffer));
+
+                let elapsed = time.elapsed().as_millis();
+
+                let (wait, c) = ((1000 / 60) as u128).overflowing_sub(elapsed);
+
+                if !c {
+                    thread::sleep(Duration::from_millis(wait as u64));
+                }
+            }
+        });
+    }
+
     let mut time = Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
+        debug!("event new");
+
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -57,8 +95,18 @@ fn main() {
             Event::RedrawRequested(_) => {
                 pixels.render().unwrap();
             }
+            Event::MainEventsCleared => match ui_receiver.recv() {
+                Ok(event) => match event {
+                    UiThreadEvent::Render(buffer) => {
+                        pixels.get_frame().copy_from_slice(buffer.as_slice());
+                    }
+                },
+                _ => {}
+            },
             _ => {}
         }
+
+        debug!("control_flow new");
 
         match *control_flow {
             ControlFlow::Exit => {}

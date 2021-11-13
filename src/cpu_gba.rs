@@ -1,7 +1,15 @@
-use crate::{arit::IntoI10, arit::IsOverflowAdd, arit::IsOverflowSub, bus::Bus};
+use std::ops::{BitAnd, Not, Shr};
+
+use crate::{
+    arit::IntoI10,
+    arit::IsOverflowAdd,
+    arit::{IntoI24, IsOverflowSub},
+    bus::Bus,
+};
 use anyhow::{bail, Result};
 use bitfield::bitfield;
 use bitmatch::bitmatch;
+use log::trace;
 use num_derive::FromPrimitive;
 use num_traits::{
     ops::overflowing::{OverflowingAdd, OverflowingSub},
@@ -79,15 +87,28 @@ bitfield! {
 impl PSR {
     pub fn set_nz_by<T>(&mut self, result: T)
     where
-        T: Eq + Ord + Default,
+        T: Eq
+            + Copy
+            + Ord
+            + Shr<usize, Output = T>
+            + BitAnd<Output = T>
+            + Not<Output = T>
+            + Default,
     {
-        self.set_n(result < Default::default());
-        self.set_z(result == Default::default());
+        self.set_n(result & !(!T::default() >> 1) > T::default());
+        self.set_z(result == T::default());
     }
 
     pub fn set_pl_nzcv_by<T>(&mut self, left: T, right: T)
     where
-        T: OverflowingAdd + IsOverflowAdd + Copy + Ord + Default,
+        T: OverflowingAdd
+            + IsOverflowAdd
+            + Shr<usize, Output = T>
+            + BitAnd<Output = T>
+            + Not<Output = T>
+            + Copy
+            + Ord
+            + Default,
     {
         self.set_pl_nzc_by(left, right);
         self.set_pl_v_by(left, right);
@@ -95,7 +116,13 @@ impl PSR {
 
     pub fn set_pl_nzc_by<T>(&mut self, left: T, right: T)
     where
-        T: OverflowingAdd + Ord + Default,
+        T: OverflowingAdd
+            + Copy
+            + Ord
+            + Shr<usize, Output = T>
+            + BitAnd<Output = T>
+            + Not<Output = T>
+            + Default,
     {
         let (result, c) = left.overflowing_add(&right);
         self.set_nz_by(result);
@@ -104,7 +131,14 @@ impl PSR {
 
     pub fn set_ng_nzcv_by<T>(&mut self, left: T, right: T)
     where
-        T: OverflowingSub + IsOverflowSub + Copy + Ord + Default,
+        T: OverflowingSub
+            + IsOverflowSub
+            + Copy
+            + Ord
+            + Shr<usize, Output = T>
+            + BitAnd<Output = T>
+            + Not<Output = T>
+            + Default,
     {
         self.set_ng_nzc_by(left, right);
         self.set_ng_v_by(left, right);
@@ -112,11 +146,17 @@ impl PSR {
 
     pub fn set_ng_nzc_by<T>(&mut self, left: T, right: T)
     where
-        T: OverflowingSub + Ord + Default,
+        T: OverflowingSub
+            + Copy
+            + Ord
+            + Shr<usize, Output = T>
+            + BitAnd<Output = T>
+            + Not<Output = T>
+            + Default,
     {
         let (result, c) = left.overflowing_sub(&right);
         self.set_nz_by(result);
-        self.set_c(c);
+        self.set_c(!c);
     }
 
     pub fn set_pl_v_by<T>(&mut self, left: T, right: T)
@@ -244,7 +284,7 @@ impl R {
             Registers::R12 => self.fiq_r[4].get(mode),
             Registers::SP => self.mode_r[0].get(mode),
             Registers::LR => self.mode_r[1].get(mode),
-            Registers::PC => self.pc,
+            Registers::PC => self.pc + if self.cpsr.t() { 2 } else { 4 },
         }
     }
 
@@ -315,7 +355,7 @@ pub struct Cpu {
     stalls: u32,
     halt: bool,
 
-    bus: Bus,
+    pub bus: Bus,
 }
 
 impl Cpu {
@@ -330,7 +370,11 @@ impl Cpu {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        // TODO
+        self.r.pc = 0x0800_0000;
+        self.r.cpsr.0 = 0x6000_001F;
+        self.r.set(Registers::SP, 0x0300_7F00);
+        self.r.set(Registers::R0, 0x0800_0000);
+        self.r.set(Registers::R1, 0x0000_00EA);
         Ok(())
     }
 
@@ -351,16 +395,36 @@ impl Cpu {
             return Ok(());
         }
 
+        let register_status = (0u8..=15u8)
+            .map(|r| Registers::from(r))
+            .map(|r| format!("{:08X}", self.r.get(r)))
+            .collect::<Vec<_>>()
+            .join(" ");
+
         if self.r.cpsr.t() {
             let opecode = self.bus.read_16(self.r.pc)?;
 
             self.r.pc = self.r.pc.wrapping_add(2);
+
+            trace!(
+                "{} cpsr: {:08X} {:04X}",
+                register_status,
+                self.r.cpsr.0,
+                opecode
+            );
 
             self.do_mnemonic_thumb(opecode)?;
         } else {
             let opecode = self.bus.read_32(self.r.pc)?;
 
             self.r.pc = self.r.pc.wrapping_add(4);
+
+            trace!(
+                "{} cpsr: {:08X} {:04X}",
+                register_status,
+                self.r.cpsr.0,
+                opecode
+            );
 
             self.do_mnemonic(opecode)?;
         }
@@ -390,26 +454,33 @@ impl Cpu {
             Cond::Ge => cpsr.n() == cpsr.v(),
             Cond::Lt => cpsr.n() != cpsr.v(),
             Cond::Gt => !cpsr.z() && (cpsr.n() == cpsr.v()),
-            Cond::Le => cpsr.z() && (cpsr.n() != cpsr.v()),
+            Cond::Le => cpsr.z() || (cpsr.n() != cpsr.v()),
             Cond::Al => true,
             Cond::Nv => false,
         }
     }
 
     #[bitmatch]
-    fn op2_im(&self, p: u32) -> (u32, bool) {
+    fn op2_im(&self, p: u32) -> (u32, Option<bool>) {
         #[bitmatch]
         let "ssss_nnnnnnnn" = p;
 
-        (n.rotate_right(s), n & 1 == 1)
+        if s == 0 {
+            (n, None)
+        } else {
+            let val = n.rotate_right(s * 2);
+            (val, Some(val & (1 << 31) > 0))
+        }
     }
 
     #[bitmatch]
-    fn op2_reg(&self, p: u32) -> (u32, bool) {
+    fn op2_reg(&self, p: u32) -> (u32, Option<bool>) {
         #[bitmatch]
         let "ssss_sttfrrrr" = p;
 
         let val = self.r.get(Registers::from(r));
+
+        let c_not_affected = f == 1 && (s >> 1) == 0;
 
         let shift = if f == 1 {
             let r = s >> 1;
@@ -418,24 +489,62 @@ impl Cpu {
             s
         };
 
+        let zero_shift = f == 0 && shift == 0;
+
         match t {
             // LSL
-            0b00 => val.overflowing_shl(shift),
+            0b00 => {
+                if !zero_shift {
+                    let result = if shift < 32 { val << shift } else { 0 };
+
+                    let c = (if shift < 32 { val >> (32 - shift) } else { val }) & 1 > 0;
+                    (result, if c_not_affected { None } else { Some(c) })
+                } else {
+                    (val, None)
+                }
+            }
             // LSR
-            0b01 => val.overflowing_shr(shift),
+            0b01 => {
+                let shift = if !zero_shift { shift } else { 32 };
+                let result = val.wrapping_shr(shift);
+                let c = val.wrapping_shr(shift - 1) & 1 > 0;
+                (result, if c_not_affected { None } else { Some(c) })
+            }
             // ASR
             0b10 => {
-                let (result, c) = (val as i32).overflowing_shr(shift);
+                let (result, c) =
+                    (val as i32).overflowing_shr(if !zero_shift { shift } else { 32 });
 
-                (result as u32, c)
+                (result as u32, if c_not_affected { None } else { Some(c) })
             }
             // ROR
-            0b11 => (val.rotate_right(shift), val & 1 == 1),
+            0b11 => {
+                if !zero_shift {
+                    (
+                        val.rotate_right(shift),
+                        if c_not_affected {
+                            None
+                        } else {
+                            Some(val & 1 == 1)
+                        },
+                    )
+                } else {
+                    let c = if self.r.cpsr.c() { 1 } else { 0 };
+                    (
+                        (c << 31) | (val >> 1),
+                        if c_not_affected {
+                            None
+                        } else {
+                            Some(val & 1 == 1)
+                        },
+                    )
+                }
+            }
             _ => panic!("invalid op2 shift type"),
         }
     }
 
-    fn op2(&self, i: u32, p: u32) -> (u32, bool) {
+    fn op2(&self, i: u32, p: u32) -> (u32, Option<bool>) {
         if i == 1 {
             self.op2_im(p)
         } else {
@@ -443,7 +552,21 @@ impl Cpu {
         }
     }
 
-    fn low_registers(&self, rlist: u8) -> Vec<Registers> {
+    fn rlist(&self, rlist: u16) -> Vec<Registers> {
+        let mut registers = vec![];
+
+        for r in 0u16..16u16 {
+            if rlist & (1 << r) == 0 {
+                continue;
+            }
+
+            registers.push(Registers::from(r));
+        }
+
+        registers
+    }
+
+    fn rlist_low(&self, rlist: u8) -> Vec<Registers> {
         let mut registers = vec![];
 
         for r in 0u8..8u8 {
@@ -462,60 +585,124 @@ impl Cpu {
         #[bitmatch]
         match &opecode {
             // B
-            "cccc1010_nnnnnnnn_nnnnnnnn_nnnnnnnn" if self.guard(c) => self.b(n as i32),
+            "cccc1010_nnnnnnnn_nnnnnnnn_nnnnnnnn" => {
+                // trace!("B {:08X}", n);
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.b(n.into_i24())
+            }
 
             // BL
-            "cccc1011_nnnnnnnn_nnnnnnnn_nnnnnnnn" if self.guard(c) => self.bl(n as i32),
+            "cccc1011_nnnnnnnn_nnnnnnnn_nnnnnnnn" => {
+                // trace!("BL {:08X}", n);
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.bl(n.into_i24())
+            }
 
             // BX
-            "cccc0001_00101111_11111111_0001rrrr" if self.guard(c) => self.bx(Registers::from(r)),
+            "cccc0001_00101111_11111111_0001rrrr" => {
+                // trace!("BX {:01X}", r);
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.bx(Registers::from(r))
+            }
 
             // SWI
-            "cccc1111_????????_????????_????????" if self.guard(c) => self.swi(),
+            "cccc1111_????????_????????_????????" => {
+                // trace!("SWI");
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.swi()
+            }
 
             // BKPT
-            "cccc0001_0010????_????????_0111????" if self.guard(c) => self.bkpt(),
+            "cccc0001_0010????_????????_0111????" => {
+                // trace!("BKPT");
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.bkpt()
+            }
 
             // UND
-            "cccc011?_????????_????????_???1????" if self.guard(c) => self.und(),
+            "cccc011?_????????_????????_???1????" => {
+                // trace!("UND");
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.und()
+            }
 
             // MRS
-            "cccc0001_0p001111_rrrr0000_00000000" if self.guard(c) => {
+            "cccc0001_0p001111_rrrr0000_00000000" => {
+                // trace!("MRS {:01X}, {:01X}", p, r);
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
                 self.mrs(p, Registers::from(r))
             }
 
             // MSR Register
-            "cccc0001_0p10fsxc_11110000_0000rrrr" if self.guard(c) => {
+            "cccc0001_0p10fsxt_11110000_0000rrrr" => {
+                // trace!(
+                //     "MSR Register {:01X}, {:01X}, {:01X}, {:01X}, {:01X}, {:01X}",
+                //     p,
+                //     f,
+                //     s,
+                //     x,
+                //     t,
+                //     r
+                // );
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
                 let val = self.r.get(Registers::from(r));
 
-                self.msr(p, f == 1, s == 1, x == 1, c == 1, PSR(val))
+                self.msr(p, f == 1, s == 1, x == 1, t == 1, PSR(val))
             }
 
             // MSR Immediate
-            "cccc0011_0p10fsxc_1111iiii_jjjjjjjj" if self.guard(c) => {
-                let val = j.rotate_right(i);
+            "cccc0011_0p10fsxt_1111iiii_jjjjjjjj" => {
+                // trace!(
+                //     "MSR Immediate {:01X}, {:01X}, {:01X}, {:01X}, {:01X}, {:01X}, {:02X}",
+                //     p,
+                //     f,
+                //     s,
+                //     x,
+                //     t,
+                //     i,
+                //     j
+                // );
 
-                self.msr(p, f == 1, s == 1, x == 1, c == 1, PSR(val))
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                let val = j.rotate_right(i * 2);
+
+                self.msr(p, f == 1, s == 1, x == 1, t == 1, PSR(val))
             }
-
-            // ALU
-            "cccc00io_ooosrrrr_ggggpppp_pppppppp" if self.guard(c) => self.alu(
-                o,
-                s == 1,
-                Registers::from(r),
-                Registers::from(g),
-                self.op2(i, p),
-            ),
-
-            // Multiply
-            "cccc000o_ooosrrrr_ggggffff_1001hhhh" if self.guard(c) => self.multiply(
-                o,
-                s == 1,
-                Registers::from(r),
-                Registers::from(g),
-                Registers::from(f),
-                Registers::from(h),
-            ),
 
             // Single Data Transfer - post-indexing
             "cccc01i0_ubtlrrrr_ggggpppp_pppppppp" if self.guard(c) => self
@@ -563,34 +750,24 @@ impl Cpu {
                 ),
 
             // block data transfer - pre-indexing
-            "cccc1001_uswlrrrr_ggggffff_hhhhkkkk" if self.guard(c) => self.block_data_transfer_pre(
+            "cccc1001_uswlrrrr_gggggggg_gggggggg" if self.guard(c) => self.block_data_transfer_pre(
                 u,
                 s == 1,
                 w == 1,
                 l,
                 Registers::from(r),
-                vec![
-                    Registers::from(g),
-                    Registers::from(f),
-                    Registers::from(h),
-                    Registers::from(k),
-                ],
+                self.rlist(g as u16),
             ),
 
             // block data transfer - post-indexing
-            "cccc1000_uswlrrrr_ggggffff_hhhhkkkk" if self.guard(c) => self
+            "cccc1000_uswlrrrr_gggggggg_gggggggg" if self.guard(c) => self
                 .block_data_transfer_post(
                     u,
                     s == 1,
                     w == 1,
                     l,
                     Registers::from(r),
-                    vec![
-                        Registers::from(g),
-                        Registers::from(f),
-                        Registers::from(h),
-                        Registers::from(k),
-                    ],
+                    self.rlist(g as u16),
                 ),
 
             // SWP
@@ -600,6 +777,49 @@ impl Cpu {
                 Registers::from(g),
                 Registers::from(f),
             ),
+
+            // ALU
+            "cccc00io_ooosrrrr_ggggpppp_pppppppp" => {
+                // trace!(
+                //     "ALU {:01X}, {:01X}, {:01X}, {:01X}, {:01X}, {:02X}",
+                //     i,
+                //     o,
+                //     s,
+                //     r,
+                //     g,
+                //     p
+                // );
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.alu(
+                    o,
+                    s == 1,
+                    Registers::from(r),
+                    Registers::from(g),
+                    self.op2(i, p),
+                )
+            }
+
+            // Multiply
+            "cccc000o_ooosrrrr_ggggffff_1001hhhh" => {
+                // trace!("Multiply");
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.multiply(
+                    o,
+                    s == 1,
+                    Registers::from(r),
+                    Registers::from(g),
+                    Registers::from(f),
+                    Registers::from(h),
+                )
+            }
 
             _ => Ok(()),
         }
@@ -968,7 +1188,7 @@ impl Cpu {
 
             // push/pop registers
             "1011o10s_nnnnnnnn" => {
-                let mut registers = self.low_registers(n as u8);
+                let mut registers = self.rlist_low(n as u8);
 
                 match o {
                     // PUSH
@@ -994,7 +1214,7 @@ impl Cpu {
             // multiple load/store
             "1100obbb_nnnnnnnn" => {
                 let rb = Registers::from(b);
-                let registers = self.low_registers(n as u8);
+                let registers = self.rlist_low(n as u8);
 
                 match o {
                     // STMIA
@@ -1055,8 +1275,13 @@ impl Cpu {
     fn bx(&mut self, r: Registers) -> Result<()> {
         let val = self.r.get(r);
 
-        self.r.pc = val;
-        self.r.cpsr.set_t(val & 1 == 1);
+        if val & 1 == 1 {
+            self.r.pc = val - 1;
+            self.r.cpsr.set_t(true);
+        } else {
+            self.r.pc = val;
+            self.r.cpsr.set_t(false);
+        }
 
         Ok(())
     }
@@ -1079,7 +1304,7 @@ impl Cpu {
         state: bool,
         rn: Registers,
         rd: Registers,
-        op2: (u32, bool),
+        op2: (u32, Option<bool>),
     ) -> Result<()> {
         let cpsr = match opcode {
             // AND
@@ -1129,7 +1354,7 @@ impl Cpu {
         left: u32,
         right: u32,
         rd: Registers,
-        c: bool,
+        c: Option<bool>,
         f: Operation,
     ) -> Result<PSR>
     where
@@ -1141,7 +1366,10 @@ impl Cpu {
 
         let mut cpsr = self.r.cpsr;
         cpsr.set_nz_by(result);
-        cpsr.set_c(c);
+
+        if let Some(c) = c {
+            cpsr.set_c(c);
+        }
 
         Ok(cpsr)
     }
@@ -1186,7 +1414,13 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn _alu_test<Operation>(&mut self, left: u32, right: u32, c: bool, f: Operation) -> Result<PSR>
+    fn _alu_test<Operation>(
+        &mut self,
+        left: u32,
+        right: u32,
+        c: Option<bool>,
+        f: Operation,
+    ) -> Result<PSR>
     where
         Operation: Fn(u32, u32) -> u32,
     {
@@ -1194,32 +1428,41 @@ impl Cpu {
 
         let mut cpsr = self.r.cpsr;
         cpsr.set_nz_by(result);
-        cpsr.set_c(c);
+
+        if let Some(c) = c {
+            cpsr.set_c(c);
+        }
 
         Ok(cpsr)
     }
 
-    fn and(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn and(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left & right)
     }
 
-    fn eor(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn eor(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left ^ right)
     }
 
-    fn sub(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
-        self._alu_arit_ng(self.r.get(rn), op2, rd, |left, right| left - right)
+    fn sub(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
+        self._alu_arit_ng(self.r.get(rn), op2, rd, |left, right| {
+            left.wrapping_sub(right)
+        })
     }
 
-    fn rsb(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
-        self._alu_arit_ng(op2, self.r.get(rn), rd, |left, right| left - right)
+    fn rsb(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
+        self._alu_arit_ng(op2, self.r.get(rn), rd, |left, right| {
+            left.wrapping_sub(right)
+        })
     }
 
-    fn add(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
-        self._alu_arit_pl(self.r.get(rn), op2, rd, |left, right| left + right)
+    fn add(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
+        self._alu_arit_pl(self.r.get(rn), op2, rd, |left, right| {
+            left.wrapping_add(right)
+        })
     }
 
-    fn adc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
+    fn adc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
         let val1 = self.r.get(rn);
         let val2 = op2;
         let val3 = self.r.cpsr.c() as u32;
@@ -1253,29 +1496,29 @@ impl Cpu {
 
         let mut cpsr = self.r.cpsr;
         cpsr.set_nz_by(result2);
-        cpsr.set_c(c1 | c2);
+        cpsr.set_c(!c1 & !c2);
         cpsr.set_v(v1 | v2);
 
         Ok(cpsr)
     }
 
-    fn sbc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
+    fn sbc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
         self._sbc(self.r.get(rn), op2, rd)
     }
 
-    fn rsc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
+    fn rsc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
         self._sbc(op2, self.r.get(rn), rd)
     }
 
-    fn tst(&mut self, rn: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn tst(&mut self, rn: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_test(self.r.get(rn), op2, c, |left, right| left & right)
     }
 
-    fn teq(&mut self, rn: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn teq(&mut self, rn: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_test(self.r.get(rn), op2, c, |left, right| left ^ right)
     }
 
-    fn cmp(&mut self, rn: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
+    fn cmp(&mut self, rn: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
         let left = self.r.get(rn);
         let right = op2;
 
@@ -1285,7 +1528,7 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn cmn(&mut self, rn: Registers, (op2, _): (u32, bool)) -> Result<PSR> {
+    fn cmn(&mut self, rn: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
         let left = self.r.get(rn);
         let right = op2;
 
@@ -1295,19 +1538,19 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn orr(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn orr(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left | right)
     }
 
-    fn mov(&mut self, rd: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn mov(&mut self, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_logical(op2, 0, rd, c, |left, _| left)
     }
 
-    fn bic(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn bic(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left & !right)
     }
 
-    fn mvn(&mut self, rd: Registers, (op2, c): (u32, bool)) -> Result<PSR> {
+    fn mvn(&mut self, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
         self._alu_logical(op2, 0, rd, c, |left, _| !left)
     }
 
@@ -1446,7 +1689,7 @@ impl Cpu {
         Ok(())
     }
 
-    fn msr(&mut self, p: u32, f: bool, _s: bool, _x: bool, c: bool, val: PSR) -> Result<()> {
+    fn msr(&mut self, p: u32, f: bool, _s: bool, _x: bool, t: bool, val: PSR) -> Result<()> {
         let mut psr = if p == 0 {
             self.r.cpsr
         } else {
@@ -1460,7 +1703,7 @@ impl Cpu {
             psr.set_v(val.v());
         }
 
-        if c && psr.mode() == Mode::Supervisor {
+        if t && psr.mode() == Mode::Supervisor {
             psr.set_i(val.i());
             psr.set_f(val.f());
             psr.set_t(val.t());
@@ -1514,7 +1757,7 @@ impl Cpu {
         load_store: u32,
         rn: Registers,
         rd: Registers,
-        (offset, _): (u32, bool),
+        (offset, _): (u32, Option<bool>),
     ) -> Result<()> {
         let base_addr = self.r.get(rn);
 
@@ -1547,7 +1790,7 @@ impl Cpu {
         load_store: u32,
         rn: Registers,
         rd: Registers,
-        (offset, _): (u32, bool),
+        (offset, _): (u32, Option<bool>),
     ) -> Result<()> {
         let addr = self.r.get(rn);
 
@@ -1644,11 +1887,16 @@ impl Cpu {
         rn: Registers,
         rlist: Vec<Registers>,
     ) -> Result<()> {
-        let mut rlist = rlist.clone();
-        rlist.sort();
+        // trace!("Block Data Transfer Pre-Indexing");
 
         let base_addr = self.r.get(rn);
         let mut offset: i32 = 0;
+
+        let mut rlist = rlist.clone();
+
+        if up_down == 0 {
+            rlist.reverse();
+        };
 
         for r in rlist.into_iter() {
             offset = if up_down == 1 {
@@ -1682,11 +1930,16 @@ impl Cpu {
         rn: Registers,
         rlist: Vec<Registers>,
     ) -> Result<()> {
-        let mut rlist = rlist.clone();
-        rlist.sort();
+        // trace!("Block Data Transfer Post-Indexing");
 
         let base_addr = self.r.get(rn);
         let mut offset: i32 = 0;
+
+        let mut rlist = rlist.clone();
+
+        if up_down == 0 {
+            rlist.reverse();
+        };
 
         for r in rlist.into_iter() {
             let addr = ((base_addr as i32) + offset) as u32;
