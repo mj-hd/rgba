@@ -2,6 +2,15 @@ use anyhow::Result;
 use bitfield::bitfield;
 use image::{ImageBuffer, Rgba};
 
+enum BgMode {
+    Mode0,
+    Mode1,
+    Mode2,
+    Mode3,
+    Mode4,
+    Mode5,
+}
+
 bitfield! {
     #[derive(Default, Clone, Copy)]
     struct DispCnt(u16);
@@ -19,33 +28,59 @@ bitfield! {
     h_blank_interval_free, _: 5;
     display_frame_select, _: 4;
     cgb_mode, _: 3;
-    bg_mode, _: 2, 0;
+    _bg_mode, _: 3, 0;
+}
+
+impl DispCnt {
+    fn bg_mode(&self) -> BgMode {
+        match self._bg_mode() {
+            0 => BgMode::Mode0,
+            1 => BgMode::Mode1,
+            2 => BgMode::Mode2,
+            3 => BgMode::Mode3,
+            4 => BgMode::Mode4,
+            5 => BgMode::Mode5,
+            _ => panic!("unknown bg mode"),
+        }
+    }
 }
 
 bitfield! {
     #[derive(Default, Clone, Copy)]
     struct DispStat(u16);
     impl Debug;
-    v_count_settings, _: 8, 8;
-    v_counter_irq_enable, _: 5;
-    h_blank_irq_enable, _: 4;
-    v_blank_irq_enable, _: 3;
-    v_counter, _: 2;
-    h_blank, _: 1;
-    v_blank, _: 0;
+    v_count_settings, set_v_count_settings: 8, 8;
+    v_counter_irq_enable, set_v_counter_irq_enable: 5;
+    h_blank_irq_enable, set_h_blank_irq_enable: 4;
+    v_blank_irq_enable, set_v_blank_irq_enable: 3;
+    v_counter, set_v_counter: 2;
+    h_blank, set_h_blank: 1;
+    v_blank, set_v_blank: 0;
 }
 
 bitfield! {
     #[derive(Default, Clone, Copy)]
     struct BgCnt(u16);
     impl Debug;
-    screen_size, _: 2, 14;
+    _screen_size, _: 2, 14;
     display_area_overflow, _: 13;
     screen_base_block, _: 5, 8;
     colors_palette, _: 7;
     mosaic, _: 6;
     char_base_block, _: 2, 2;
     bg_priority, _: 2, 0;
+}
+
+impl BgCnt {
+    fn screen_size(&self) -> (usize, usize) {
+        match self._screen_size() {
+            0b00 => (256, 256),
+            0b01 => (512, 256),
+            0b10 => (256, 512),
+            0b11 => (512, 512),
+            _ => panic!("unknown screen size"),
+        }
+    }
 }
 
 bitfield! {
@@ -155,19 +190,71 @@ bitfield! {
     eva_coef, _: 5, 0;
 }
 
-enum Mode {
-    Mode0,
-    Mode1,
-    Mode2,
-    Mode3,
+bitfield! {
+    #[derive(Default, Clone, Copy)]
+    struct Color(u16);
+    impl Debug;
+    u8, blue, _: 5, 10;
+    u8, green, _: 5, 5;
+    u8, red, _: 5, 0;
+}
+
+impl Color {
+    fn to_pixel(&self) -> Rgba<u8> {
+        Rgba([self.red() * 8, self.green() * 8, self.blue() * 8, 0xFF])
+    }
+}
+
+bitfield! {
+    #[derive(Default, Clone, Copy)]
+    struct Oam0(u16);
+    impl Debug;
+    shape, _: 2, 14;
+    colors_palettes, _: 13;
+    obj_mosaic, _: 12;
+    obj_mode, _: 2, 10;
+    obj_disable_double_size, _: 9;
+    rotation_scaling, _: 8;
+    y, _: 8, 0;
+}
+
+bitfield! {
+    #[derive(Default, Clone, Copy)]
+    struct Oam1(u16);
+    impl Debug;
+    obj_size, _: 2, 14;
+    v_flip, _: 13;
+    h_flip, _: 12;
+    rotation_scaling_parameter_selection, _: 5, 9;
+    rotation_scaling, _: 8;
+    x, _: 8, 0;
+}
+
+bitfield! {
+    #[derive(Default, Clone, Copy)]
+    struct Oam2(u16);
+    impl Debug;
+    palette_number, _: 4, 12;
+    priority_relative_to_bg, _: 2, 10;
+    character_name, _: 10, 0;
+}
+
+bitfield! {
+    #[derive(Default, Clone, Copy)]
+    struct TextBgScreen(u16);
+    impl Debug;
+    palette_number, _: 4, 12;
+    v_flip, _: 11;
+    h_flip, _: 10;
+    tile_number, _: 10, 0;
 }
 
 pub struct Ppu {
-    mode: Mode,
-
     palette: Box<[u8; 0x400]>,
     vram: Box<[u8; 0x1_8000]>,
     sprite: Box<[u8; 0x400]>,
+
+    h_count: u16,
 
     dispcnt: DispCnt,
     green_swap: bool,
@@ -228,7 +315,6 @@ pub struct Ppu {
 impl Ppu {
     pub fn new() -> Self {
         Self {
-            mode: Mode::Mode0,
             palette: Box::new([0; 0x400]),
             vram: Box::new([0; 0x1_8000]),
             sprite: Box::new([0; 0x400]),
@@ -275,11 +361,175 @@ impl Ppu {
             bld_cnt: Default::default(),
             bld_alpha: Default::default(),
             bld_y: Default::default(),
+            h_count: 0,
         }
     }
 
     pub fn tick(&mut self) -> Result<()> {
+        match self.h_count {
+            // Visible
+            0..=959 => {
+                self.dispstat.set_h_blank(false);
+            }
+            // HBlank
+            960..=1231 => self.dispstat.set_h_blank(true),
+            _ => {}
+        }
+
+        match self.v_count {
+            // Visible
+            0..=159 => {
+                self.dispstat.set_v_blank(false);
+            }
+            // VBlank
+            160..=227 => {
+                self.dispstat.set_v_blank(true);
+            }
+            _ => {}
+        }
+
+        if !self.dispstat.v_blank() && !self.dispstat.h_blank() {
+            self.render_bg()?;
+        }
+
+        self.h_count += 1;
+
+        if self.h_count == 1232 {
+            self.h_count = 0;
+            self.v_count += 1;
+        }
+
+        if self.v_count == 228 {
+            self.v_count = 0;
+        }
+
         Ok(())
+    }
+
+    fn render_bg(&mut self) -> Result<()> {
+        match self.dispcnt.bg_mode() {
+            BgMode::Mode0 => {
+                if self.dispcnt.screen_display_bg0() {
+                    self.render_tile_screen(self.bg_0_cnt)?;
+                }
+
+                if self.dispcnt.screen_display_bg1() {
+                    self.render_tile_screen(self.bg_1_cnt)?;
+                }
+                if self.dispcnt.screen_display_bg2() {
+                    self.render_tile_screen(self.bg_2_cnt)?;
+                }
+                if self.dispcnt.screen_display_bg3() {
+                    self.render_tile_screen(self.bg_3_cnt)?;
+                }
+
+                Ok(())
+            }
+            BgMode::Mode1 => Ok(()),
+            BgMode::Mode3 => {
+                if self.dispcnt.screen_display_bg2() {
+                    self.render_bitmap_screen(self.bg_2_cnt)?;
+                }
+
+                Ok(())
+            }
+            BgMode::Mode4 => Ok(()),
+            BgMode::Mode5 => Ok(()),
+            _ => Ok(()),
+        }
+    }
+
+    fn render_tile_screen(&mut self, bg_cnt: BgCnt) -> Result<()> {
+        if self.bg_0_cnt.colors_palette() {
+            self.render_tile_screen_256colors(bg_cnt)
+        } else {
+            self.render_tile_screen_16colors(bg_cnt)
+        }
+    }
+
+    fn render_tile_screen_256colors(&mut self, bg_cnt: BgCnt) -> Result<()> {
+        // 8bpp
+
+        let x = self.h_count as u32;
+        let y = self.v_count as u32;
+
+        let tile_index = x / 32 + y * 32;
+
+        let priority = bg_cnt.bg_priority();
+        let map_base_addr = bg_cnt.screen_base_block() as u32 * 2 * 1024;
+        let char_base_addr = bg_cnt.char_base_block() as u32 * 16 * 1024;
+        let screen_size = bg_cnt.screen_size();
+
+        let map = TextBgScreen(self.read_vram_16(map_base_addr + tile_index * 2)?);
+        let tile_addr = char_base_addr + (map.tile_number() as u32 * 64);
+        let tile_row = self.read_vram_16(tile_addr * y * 8)?;
+
+        // left pixel
+        let color_offset = (tile_row & 0xFF) as u32;
+
+        let palette_base_addr = 0x0500_0000;
+
+        let color = Color(self.read_vram_16(palette_base_addr + color_offset)?);
+
+        self.current_frame.put_pixel(x, y, color.to_pixel());
+
+        Ok(())
+    }
+
+    fn render_tile_screen_16colors(&mut self, bg_cnt: BgCnt) -> Result<()> {
+        // 4bpp
+
+        let x = self.h_count as u32;
+        let y = self.v_count as u32;
+
+        let tile_index = x / 32 + y * 32;
+
+        let priority = bg_cnt.bg_priority();
+        let map_base_addr = bg_cnt.screen_base_block() as u32 * 2 * 1024;
+        let char_base_addr = bg_cnt.char_base_block() as u32 * 16 * 1024;
+        let screen_size = bg_cnt.screen_size();
+
+        let map = TextBgScreen(self.read_vram_16(map_base_addr + tile_index * 2)?);
+        let tile_addr = char_base_addr + (map.tile_number() as u32 * 32);
+        let tile_row = self.read_vram_16(tile_addr * y * 4)?;
+
+        let palette_index = map.palette_number() as usize;
+
+        let palette_base_addr = 0x0500_0000 + map.palette_number() as u32 * 2 * 16;
+
+        // left pixel
+        let color_index = (tile_row & 0xF) as usize;
+        let color = Color(self.read_vram_16(palette_base_addr + color_index as u32 * 2)?);
+
+        self.current_frame.put_pixel(x, y, color.to_pixel());
+
+        Ok(())
+    }
+
+    fn render_bitmap_screen(&mut self, bg_cnt: BgCnt) -> Result<()> {
+        // Bitmap Mode 240x160 pixels, 32768 colors
+
+        let x = self.h_count as u32;
+        let y = self.v_count as u32;
+
+        let index = y * 480 + x;
+
+        let base_addr = 0x0600_0000;
+        let color = Color(self.read_vram_16(base_addr + index)?);
+
+        self.current_frame.put_pixel(x, y, color.to_pixel());
+
+        Ok(())
+    }
+
+    fn dimensional_character_mapping(&self) -> u8 {
+        if self.dispcnt.obj_character_vram_mapping() {
+            // One Dimensional Character Mapping
+            0
+        } else {
+            // Two Dimensional Character Mapping
+            0
+        }
     }
 
     pub fn read_vram_8(&self, addr: u32) -> Result<u8> {
@@ -289,6 +539,13 @@ impl Ppu {
             0x0700_0000..=0x0700_3FFF => Ok(self.sprite[(addr - 0x0700_0000) as usize]),
             _ => Ok(0),
         }
+    }
+
+    pub fn read_vram_16(&self, addr: u32) -> Result<u16> {
+        let low = self.read_vram_8(addr)?;
+        let high = self.read_vram_8(addr + 1)?;
+
+        Ok((high as u16) << 8 | low as u16)
     }
 
     pub fn write_vram_8(&mut self, addr: u32, val: u8) -> Result<()> {
@@ -310,6 +567,13 @@ impl Ppu {
             }
             _ => Ok(()),
         }
+    }
+
+    pub fn write_vram_16(&mut self, addr: u32, val: u16) -> Result<()> {
+        self.write_vram_8(addr, val as u8)?;
+        self.write_vram_8(addr + 1, (val >> 8) as u8)?;
+
+        Ok(())
     }
 
     pub fn read_dispcnt(&self) -> Result<u16> {

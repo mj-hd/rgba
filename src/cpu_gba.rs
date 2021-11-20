@@ -370,11 +370,9 @@ impl Cpu {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.r.pc = 0x0800_0000;
-        self.r.cpsr.0 = 0x6000_001F;
+        self.r.pc = 0x0000_0000;
+        self.r.cpsr.0 = 0x0000_001F;
         self.r.set(Registers::SP, 0x0300_7F00);
-        self.r.set(Registers::R0, 0x0800_0000);
-        self.r.set(Registers::R1, 0x0000_00EA);
         Ok(())
     }
 

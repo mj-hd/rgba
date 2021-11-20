@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{ppu::Ppu, rom::Rom};
+use crate::{bios::BIOS, ppu::Ppu, rom::Rom};
 
 pub struct Bus {
     wram_onboard: Box<[u8; 0x4_0000]>,
@@ -38,6 +38,7 @@ impl Bus {
 
     pub fn read_8(&self, addr: u32) -> Result<u8> {
         match addr {
+            0x0000_0000..=0x0003_FFFF => Ok(BIOS[addr as usize]),
             0x0200_0000..=0x0203_FFFF => Ok(self.wram_onboard[(addr - 0x0200_0000) as usize]),
             0x0300_0000..=0x0300_7FFF => Ok(self.wram_onchip[(addr - 0x0300_0000) as usize]),
             0x0400_0000..=0x04FF_FFFF => {
@@ -97,6 +98,7 @@ impl Bus {
             0x0400_0050 => self.ppu.read_bld_cnt(),
             0x0400_0052 => self.ppu.read_bld_alpha(),
             0x0400_0054 => self.ppu.read_bld_y(),
+            0x0400_0000..=0x04FF_FFFF => Ok(0),
             _ => {
                 let low = self.read_8(addr)?;
                 let high = self.read_8(addr + 1)?;
@@ -186,6 +188,7 @@ impl Bus {
             0x0400_0050 => self.ppu.write_bld_cnt(val),
             0x0400_0052 => self.ppu.write_bld_alpha(val),
             0x0400_0054 => self.ppu.write_bld_y(val),
+            0x0400_0000..=0x04FF_FFFF => Ok(()),
             _ => {
                 self.write_8(addr, val as u8)?;
                 self.write_8(addr + 1, (val >> 8) as u8)?;

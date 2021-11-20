@@ -48,8 +48,6 @@ fn main() {
     let mut reader = BufReader::new(File::open(args[1].clone()).unwrap());
     let rom = Rom::new(&mut reader).unwrap();
 
-    debug!("ROM: {:?}", rom);
-
     let (ui_sender, ui_receiver) = mpsc::sync_channel::<UiThreadEvent>(1);
 
     {
@@ -61,7 +59,8 @@ fn main() {
             loop {
                 let time = Instant::now();
 
-                for _ in 0..17595106 {
+                // for _ in 0..17595106 {
+                for _ in 0..89342 {
                     gba.tick().unwrap();
                 }
 
@@ -83,8 +82,6 @@ fn main() {
     let mut time = Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
-        debug!("event new");
-
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -105,8 +102,6 @@ fn main() {
             },
             _ => {}
         }
-
-        debug!("control_flow new");
 
         match *control_flow {
             ControlFlow::Exit => {}
