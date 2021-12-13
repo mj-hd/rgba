@@ -6,10 +6,10 @@ use crate::{
     arit::{IntoI24, IsOverflowSub},
     bus::Bus,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use bitfield::bitfield;
 use bitmatch::bitmatch;
-use log::trace;
+use log::{debug, trace};
 use num_derive::FromPrimitive;
 use num_traits::{
     ops::overflowing::{OverflowingAdd, OverflowingSub},
@@ -17,7 +17,7 @@ use num_traits::{
 };
 
 #[derive(Debug, FromPrimitive, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub enum Registers {
+pub enum RegisterType {
     R0,
     R1,
     R2,
@@ -36,21 +36,21 @@ pub enum Registers {
     PC,
 }
 
-impl From<u32> for Registers {
+impl From<u32> for RegisterType {
     fn from(n: u32) -> Self {
-        FromPrimitive::from_u32(n).unwrap_or(Registers::R0)
+        FromPrimitive::from_u32(n).unwrap_or(RegisterType::R0)
     }
 }
 
-impl From<u16> for Registers {
+impl From<u16> for RegisterType {
     fn from(n: u16) -> Self {
-        FromPrimitive::from_u16(n).unwrap_or(Registers::R0)
+        FromPrimitive::from_u16(n).unwrap_or(RegisterType::R0)
     }
 }
 
-impl From<u8> for Registers {
+impl From<u8> for RegisterType {
     fn from(n: u8) -> Self {
-        FromPrimitive::from_u8(n).unwrap_or(Registers::R0)
+        FromPrimitive::from_u8(n).unwrap_or(RegisterType::R0)
     }
 }
 
@@ -62,17 +62,49 @@ enum Mode {
     Abort,
     Irq,
     Undefined,
+    System,
 }
 
 impl From<u32> for Mode {
+    #[bitmatch]
     fn from(n: u32) -> Mode {
-        FromPrimitive::from_u32(n).unwrap_or(Mode::User)
+        #[bitmatch]
+        match n {
+            "0??00" => Mode::User,
+            "0??01" => Mode::Fiq,
+            "0??10" => Mode::Irq,
+            "0??11" => Mode::Supervisor,
+            "10000" => Mode::User,
+            "10001" => Mode::Fiq,
+            "10010" => Mode::Irq,
+            "10011" => Mode::Supervisor,
+            "10111" => Mode::Abort,
+            "11011" => Mode::Undefined,
+            "11111" => Mode::System,
+            _ => {
+                panic!("unsupported mode")
+            }
+        }
+    }
+}
+
+impl Into<u32> for Mode {
+    fn into(self) -> u32 {
+        match self {
+            Mode::User => 0b10000,
+            Mode::Fiq => 0b10001,
+            Mode::Irq => 0b10010,
+            Mode::Supervisor => 0b10011,
+            Mode::Abort => 0b10111,
+            Mode::Undefined => 0b11011,
+            Mode::System => 0b11111,
+        }
     }
 }
 
 bitfield! {
     #[derive(Default, Clone, Copy)]
-    pub struct PSR(u32);
+    pub struct Psr(u32);
     impl Debug;
     n, set_n: 31;
     z, set_z: 30;
@@ -81,10 +113,10 @@ bitfield! {
     i, set_i: 7;
     f, set_f: 6;
     t, set_t: 5;
-    into Mode, mode, set_mode: 4, 0;
+    into Mode, mode, set_mode: 5, 0;
 }
 
-impl PSR {
+impl Psr {
     pub fn set_nz_by<T>(&mut self, result: T)
     where
         T: Eq
@@ -245,80 +277,18 @@ where
     T: Copy,
 {
     fn get(&self, mode: Mode) -> T {
+        if mode == Mode::System {
+            return self.r[Mode::User as usize];
+        }
         self.r[mode as usize]
     }
 
     fn set(&mut self, mode: Mode, val: T) {
+        if mode == Mode::System {
+            self.r[Mode::User as usize] = val;
+            return;
+        }
         self.r[mode as usize] = val;
-    }
-}
-
-#[derive(Default)]
-pub struct R {
-    common_r: [CommonRegister; 8],
-    fiq_r: [FiqRegister; 5],
-    mode_r: [ModeRegister; 2],
-
-    pc: u32,
-    cpsr: PSR,
-    spsr: ModeRegister<PSR>,
-}
-
-impl R {
-    pub fn get(&self, r: Registers) -> u32 {
-        let mode = self.cpsr.mode();
-
-        match r {
-            Registers::R0 => self.common_r[0].get(mode),
-            Registers::R1 => self.common_r[1].get(mode),
-            Registers::R2 => self.common_r[2].get(mode),
-            Registers::R3 => self.common_r[3].get(mode),
-            Registers::R4 => self.common_r[4].get(mode),
-            Registers::R5 => self.common_r[5].get(mode),
-            Registers::R6 => self.common_r[6].get(mode),
-            Registers::R7 => self.common_r[7].get(mode),
-            Registers::R8 => self.fiq_r[0].get(mode),
-            Registers::R9 => self.fiq_r[1].get(mode),
-            Registers::R10 => self.fiq_r[2].get(mode),
-            Registers::R11 => self.fiq_r[3].get(mode),
-            Registers::R12 => self.fiq_r[4].get(mode),
-            Registers::SP => self.mode_r[0].get(mode),
-            Registers::LR => self.mode_r[1].get(mode),
-            Registers::PC => self.pc + if self.cpsr.t() { 2 } else { 4 },
-        }
-    }
-
-    pub fn set(&mut self, r: Registers, val: u32) {
-        let mode = self.cpsr.mode();
-
-        match r {
-            Registers::R0 => self.common_r[0].set(mode, val),
-            Registers::R1 => self.common_r[1].set(mode, val),
-            Registers::R2 => self.common_r[2].set(mode, val),
-            Registers::R3 => self.common_r[3].set(mode, val),
-            Registers::R4 => self.common_r[4].set(mode, val),
-            Registers::R5 => self.common_r[5].set(mode, val),
-            Registers::R6 => self.common_r[6].set(mode, val),
-            Registers::R7 => self.common_r[7].set(mode, val),
-            Registers::R8 => self.fiq_r[0].set(mode, val),
-            Registers::R9 => self.fiq_r[1].set(mode, val),
-            Registers::R10 => self.fiq_r[2].set(mode, val),
-            Registers::R11 => self.fiq_r[3].set(mode, val),
-            Registers::R12 => self.fiq_r[4].set(mode, val),
-            Registers::SP => self.mode_r[0].set(mode, val),
-            Registers::LR => self.mode_r[1].set(mode, val),
-            Registers::PC => {
-                self.pc = val;
-            }
-        }
-    }
-
-    pub fn get_spsr(&self) -> PSR {
-        self.spsr.get(self.cpsr.mode())
-    }
-
-    pub fn set_spsr(&mut self, psr: PSR) {
-        self.spsr.set(self.cpsr.mode(), psr);
     }
 }
 
@@ -348,11 +318,32 @@ impl From<u32> for Cond {
     }
 }
 
+#[derive(Default, Debug)]
+struct Exception {
+    reset: bool,
+    undefined_instruction: bool,
+    swi: bool,
+    prefetch_abort: bool,
+    data_abort: bool,
+    address_exceeds: bool,
+    irq: bool,
+    fiq: bool,
+}
+
 pub struct Cpu {
-    r: R,
+    common_r: [CommonRegister; 8],
+    fiq_r: [FiqRegister; 5],
+    mode_r: [ModeRegister; 2],
+
+    pc: u32,
+    cpsr: Psr,
+    spsr: ModeRegister<Psr>,
+
+    exception: Exception,
 
     cycles: u32,
     stalls: u32,
+    prefetch: Vec<u32>,
     halt: bool,
 
     pub bus: Bus,
@@ -361,18 +352,33 @@ pub struct Cpu {
 impl Cpu {
     pub fn new(bus: Bus) -> Self {
         Self {
-            r: Default::default(),
             cycles: 0,
             stalls: 0,
+            prefetch: vec![],
             halt: false,
             bus,
+            common_r: Default::default(),
+            fiq_r: Default::default(),
+            mode_r: Default::default(),
+            pc: 0,
+            cpsr: Default::default(),
+            spsr: Default::default(),
+            exception: Default::default(),
         }
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.r.pc = 0x0000_0000;
-        self.r.cpsr.0 = 0x0000_001F;
-        self.r.set(Registers::SP, 0x0300_7F00);
+        // self.pc = 0x0000_0000;
+        self.pc = 0x0800_0000;
+        self.cpsr.0 = 0x0000_001F;
+        self.reset_sp();
+
+        self.refresh_prefetch()?;
+        let opecode = self.fetch()?;
+        self.prefetch.insert(0, opecode);
+
+        self.exception = Default::default();
+
         Ok(())
     }
 
@@ -387,41 +393,39 @@ impl Cpu {
             return Ok(());
         }
 
-        self.interrupt()?;
+        self.do_exception()?;
 
         if self.halt {
             return Ok(());
         }
 
         let register_status = (0u8..=15u8)
-            .map(|r| Registers::from(r))
-            .map(|r| format!("{:08X}", self.r.get(r)))
+            .map(|r| RegisterType::from(r))
+            .map(|r| format!("{:08X}", self.get_r(r)))
             .collect::<Vec<_>>()
             .join(" ");
 
-        if self.r.cpsr.t() {
-            let opecode = self.bus.read_16(self.r.pc)?;
+        let opecode = self.pop_prefetch()?;
 
-            self.r.pc = self.r.pc.wrapping_add(2);
+        if self.cpsr.t() {
+            let opecode = opecode as u16;
 
             trace!(
-                "{} cpsr: {:08X} {:04X}",
+                "{} cpsr: {:08X} {:04X} prefetch: {:08X}",
                 register_status,
-                self.r.cpsr.0,
-                opecode
+                self.cpsr.0,
+                opecode,
+                self.prefetch[0],
             );
 
             self.do_mnemonic_thumb(opecode)?;
         } else {
-            let opecode = self.bus.read_32(self.r.pc)?;
-
-            self.r.pc = self.r.pc.wrapping_add(4);
-
             trace!(
-                "{} cpsr: {:08X} {:04X}",
+                "{} cpsr: {:08X} {:04X} prefetch: {:08X}",
                 register_status,
-                self.r.cpsr.0,
-                opecode
+                self.cpsr.0,
+                opecode,
+                self.prefetch[0],
             );
 
             self.do_mnemonic(opecode)?;
@@ -430,13 +434,109 @@ impl Cpu {
         Ok(())
     }
 
-    pub fn interrupt(&mut self) -> Result<()> {
-        // TODO
+    fn do_exception(&mut self) -> Result<()> {
+        if self.exception.reset {
+            self.cpsr.set_mode(Mode::Supervisor.into());
+            self.do_interrupt(0x0000_0000, true)?;
+        }
+
+        if self.exception.data_abort {
+            self.cpsr.set_mode(Mode::Abort.into());
+            self.do_interrupt(0x0000_0010, self.cpsr.f())?;
+        }
+
+        if self.exception.fiq {
+            self.cpsr.set_mode(Mode::Fiq.into());
+            self.do_interrupt(0x0000_001C, true)?;
+        }
+
+        if self.exception.irq {
+            self.cpsr.set_mode(Mode::Irq.into());
+            self.do_interrupt(0x0000_0018, self.cpsr.f())?;
+        }
+
+        if self.exception.prefetch_abort {
+            self.cpsr.set_mode(Mode::Abort.into());
+            self.do_interrupt(0x0000_000C, self.cpsr.f())?;
+        }
+
+        if self.exception.swi {
+            self.cpsr.set_mode(Mode::Supervisor.into());
+            self.do_interrupt(0x0000_0008, self.cpsr.f())?;
+        }
+
+        if self.exception.undefined_instruction {
+            self.cpsr.set_mode(Mode::Undefined.into());
+            self.do_interrupt(0x0000_0004, self.cpsr.f())?;
+        }
+
+        if self.exception.address_exceeds {
+            self.cpsr.set_mode(Mode::Supervisor.into());
+            self.do_interrupt(0x0000_0014, self.cpsr.f())?;
+        }
+
         Ok(())
     }
 
+    fn do_interrupt(&mut self, addr: u32, new_f: bool) -> Result<()> {
+        self.pc = addr;
+        self.set_r(RegisterType::LR, self.pc)?;
+        self.set_spsr(self.cpsr);
+
+        self.cpsr.set_t(false);
+        self.cpsr.set_i(true);
+        self.cpsr.set_f(new_f);
+
+        self.refresh_prefetch()?;
+
+        Ok(())
+    }
+
+    fn refresh_prefetch(&mut self) -> Result<()> {
+        self.prefetch.clear();
+
+        let opecode = self.fetch()?;
+        self.prefetch.insert(0, opecode);
+
+        self.pc = self.pc.wrapping_add(self.instr_size());
+
+        let opecode = self.fetch()?;
+        self.prefetch.insert(0, opecode);
+
+        Ok(())
+    }
+
+    fn pop_prefetch(&mut self) -> Result<u32> {
+        self.pc = self.pc.wrapping_add(self.instr_size());
+
+        let opecode = self.fetch()?;
+        self.prefetch.insert(0, opecode);
+
+        self.prefetch.pop().context("prefetch exhausted")
+    }
+
+    fn fetch(&mut self) -> Result<u32> {
+        let opecode = if self.cpsr.t() {
+            // THUMB mode
+            self.bus.read_16(self.pc)? as u32
+        } else {
+            // ARM mode
+            self.bus.read_32(self.pc)?
+        };
+
+        Ok(opecode)
+    }
+
+    fn instr_size(&self) -> u32 {
+        if self.cpsr.t() {
+            2
+        } else {
+            4
+        }
+    }
+
     fn guard(&self, cond: u32) -> bool {
-        let cpsr = self.r.cpsr;
+        let cpsr = self.cpsr;
 
         match Cond::from(cond) {
             Cond::Eq => cpsr.z(),
@@ -458,8 +558,81 @@ impl Cpu {
         }
     }
 
+    fn get_r(&self, r: RegisterType) -> u32 {
+        let mode = self.cpsr.mode();
+
+        match r {
+            RegisterType::R0 => self.common_r[0].get(mode),
+            RegisterType::R1 => self.common_r[1].get(mode),
+            RegisterType::R2 => self.common_r[2].get(mode),
+            RegisterType::R3 => self.common_r[3].get(mode),
+            RegisterType::R4 => self.common_r[4].get(mode),
+            RegisterType::R5 => self.common_r[5].get(mode),
+            RegisterType::R6 => self.common_r[6].get(mode),
+            RegisterType::R7 => self.common_r[7].get(mode),
+            RegisterType::R8 => self.fiq_r[0].get(mode),
+            RegisterType::R9 => self.fiq_r[1].get(mode),
+            RegisterType::R10 => self.fiq_r[2].get(mode),
+            RegisterType::R11 => self.fiq_r[3].get(mode),
+            RegisterType::R12 => self.fiq_r[4].get(mode),
+            RegisterType::SP => self.mode_r[0].get(mode),
+            RegisterType::LR => self.mode_r[1].get(mode),
+            RegisterType::PC => self.pc,
+        }
+    }
+
+    fn set_r(&mut self, r: RegisterType, val: u32) -> Result<()> {
+        let mode = self.cpsr.mode();
+
+        match r {
+            RegisterType::R0 => self.common_r[0].set(mode, val),
+            RegisterType::R1 => self.common_r[1].set(mode, val),
+            RegisterType::R2 => self.common_r[2].set(mode, val),
+            RegisterType::R3 => self.common_r[3].set(mode, val),
+            RegisterType::R4 => self.common_r[4].set(mode, val),
+            RegisterType::R5 => self.common_r[5].set(mode, val),
+            RegisterType::R6 => self.common_r[6].set(mode, val),
+            RegisterType::R7 => self.common_r[7].set(mode, val),
+            RegisterType::R8 => self.fiq_r[0].set(mode, val),
+            RegisterType::R9 => self.fiq_r[1].set(mode, val),
+            RegisterType::R10 => self.fiq_r[2].set(mode, val),
+            RegisterType::R11 => self.fiq_r[3].set(mode, val),
+            RegisterType::R12 => self.fiq_r[4].set(mode, val),
+            RegisterType::SP => self.mode_r[0].set(mode, val),
+            RegisterType::LR => self.mode_r[1].set(mode, val),
+            RegisterType::PC => {
+                self.pc = val;
+                self.refresh_prefetch()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_spsr(&self) -> Psr {
+        self.spsr.get(self.cpsr.mode())
+    }
+
+    fn set_spsr(&mut self, psr: Psr) {
+        self.spsr.set(self.cpsr.mode(), psr);
+    }
+
+    fn reset_sp(&mut self) {
+        self.mode_r[0].set(Mode::User, 0x0300_7F00);
+        self.mode_r[0].set(Mode::Fiq, 0x00000000);
+        self.mode_r[0].set(Mode::Supervisor, 0x03007FE0);
+        self.mode_r[0].set(Mode::Abort, 0x00000000);
+        self.mode_r[0].set(Mode::Irq, 0x03007FA0);
+        self.mode_r[0].set(Mode::Undefined, 0x00000000);
+    }
+
     #[bitmatch]
     fn op2_im(&self, p: u32) -> (u32, Option<bool>) {
+        (p, None)
+    }
+
+    #[bitmatch]
+    fn op2_im_shift(&self, p: u32) -> (u32, Option<bool>) {
         #[bitmatch]
         let "ssss_nnnnnnnn" = p;
 
@@ -476,13 +649,13 @@ impl Cpu {
         #[bitmatch]
         let "ssss_sttfrrrr" = p;
 
-        let val = self.r.get(Registers::from(r));
+        let val = self.get_r(RegisterType::from(r));
 
         let c_not_affected = f == 1 && (s >> 1) == 0;
 
         let shift = if f == 1 {
             let r = s >> 1;
-            self.r.get(Registers::from(r)) as u8 as u32
+            self.get_r(RegisterType::from(r)) as u8 as u32
         } else {
             s
         };
@@ -492,34 +665,59 @@ impl Cpu {
         match t {
             // LSL
             0b00 => {
-                if !zero_shift {
-                    let result = if shift < 32 { val << shift } else { 0 };
-
-                    let c = (if shift < 32 { val >> (32 - shift) } else { val }) & 1 > 0;
-                    (result, if c_not_affected { None } else { Some(c) })
-                } else {
+                let result = if zero_shift {
                     (val, None)
-                }
+                } else if shift == 0 {
+                    (val, None)
+                } else if shift < 32 {
+                    (
+                        val.checked_shl(shift).unwrap_or(0),
+                        Some(val.checked_shr(32 - shift).unwrap_or(0) & 1 > 0),
+                    )
+                } else if shift == 32 {
+                    (0, Some(val & 1 > 0))
+                } else {
+                    (0, Some(false))
+                };
+
+                (result.0, if c_not_affected { None } else { result.1 })
             }
             // LSR
             0b01 => {
-                let shift = if !zero_shift { shift } else { 32 };
-                let result = val.wrapping_shr(shift);
-                let c = val.wrapping_shr(shift - 1) & 1 > 0;
-                (result, if c_not_affected { None } else { Some(c) })
+                let result = if zero_shift {
+                    (0, val >> 31 > 0)
+                } else {
+                    (
+                        val.checked_shr(shift).unwrap_or(0),
+                        val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 > 0,
+                    )
+                };
+                (result.0, if c_not_affected { None } else { Some(result.1) })
             }
             // ASR
             0b10 => {
-                let (result, c) =
-                    (val as i32).overflowing_shr(if !zero_shift { shift } else { 32 });
+                let result = if zero_shift || shift >= 32 {
+                    let c = val >> 31 > 0;
+                    (if c { !0 } else { 0 }, c)
+                } else {
+                    (
+                        (val as i32).checked_shr(shift).unwrap_or(0) as u32,
+                        (val as i32)
+                            .checked_shr(shift.saturating_sub(1))
+                            .unwrap_or(0)
+                            & 1
+                            > 0,
+                    )
+                };
 
-                (result as u32, if c_not_affected { None } else { Some(c) })
+                (result.0, if c_not_affected { None } else { Some(result.1) })
             }
             // ROR
             0b11 => {
-                if !zero_shift {
+                if zero_shift {
+                    let c = if self.cpsr.c() { 1 } else { 0 };
                     (
-                        val.rotate_right(shift),
+                        (c << 31) | (val >> 1),
                         if c_not_affected {
                             None
                         } else {
@@ -527,13 +725,12 @@ impl Cpu {
                         },
                     )
                 } else {
-                    let c = if self.r.cpsr.c() { 1 } else { 0 };
                     (
-                        (c << 31) | (val >> 1),
+                        val.rotate_right(shift),
                         if c_not_affected {
                             None
                         } else {
-                            Some(val & 1 == 1)
+                            Some(val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 == 1)
                         },
                     )
                 }
@@ -544,13 +741,21 @@ impl Cpu {
 
     fn op2(&self, i: u32, p: u32) -> (u32, Option<bool>) {
         if i == 1 {
-            self.op2_im(p)
+            self.op2_im_shift(p)
         } else {
             self.op2_reg(p)
         }
     }
 
-    fn rlist(&self, rlist: u16) -> Vec<Registers> {
+    fn op2_simple(&self, i: u32, p: u32) -> (u32, Option<bool>) {
+        if i == 1 {
+            self.op2_reg(p)
+        } else {
+            self.op2_im(p)
+        }
+    }
+
+    fn rlist(&self, rlist: u16) -> Vec<RegisterType> {
         let mut registers = vec![];
 
         for r in 0u16..16u16 {
@@ -558,13 +763,13 @@ impl Cpu {
                 continue;
             }
 
-            registers.push(Registers::from(r));
+            registers.push(RegisterType::from(r));
         }
 
         registers
     }
 
-    fn rlist_low(&self, rlist: u8) -> Vec<Registers> {
+    fn rlist_low(&self, rlist: u8) -> Vec<RegisterType> {
         let mut registers = vec![];
 
         for r in 0u8..8u8 {
@@ -572,7 +777,7 @@ impl Cpu {
                 continue;
             }
 
-            registers.push(Registers::from(r));
+            registers.push(RegisterType::from(r));
         }
 
         registers
@@ -612,7 +817,7 @@ impl Cpu {
                     return Ok(());
                 }
 
-                self.bx(Registers::from(r))
+                self.bx(RegisterType::from(r))
             }
 
             // SWI
@@ -656,7 +861,7 @@ impl Cpu {
                     return Ok(());
                 }
 
-                self.mrs(p, Registers::from(r))
+                self.mrs(p, RegisterType::from(r))
             }
 
             // MSR Register
@@ -675,9 +880,9 @@ impl Cpu {
                     return Ok(());
                 }
 
-                let val = self.r.get(Registers::from(r));
+                let val = self.get_r(RegisterType::from(r));
 
-                self.msr(p, f == 1, s == 1, x == 1, t == 1, PSR(val))
+                self.msr(p, f == 1, s == 1, x == 1, t == 1, Psr(val))
             }
 
             // MSR Immediate
@@ -699,7 +904,7 @@ impl Cpu {
 
                 let val = j.rotate_right(i * 2);
 
-                self.msr(p, f == 1, s == 1, x == 1, t == 1, PSR(val))
+                self.msr(p, f == 1, s == 1, x == 1, t == 1, Psr(val))
             }
 
             // Single Data Transfer - post-indexing
@@ -709,9 +914,9 @@ impl Cpu {
                     b,
                     t,
                     l,
-                    Registers::from(r),
-                    Registers::from(g),
-                    self.op2(i, p),
+                    RegisterType::from(r),
+                    RegisterType::from(g),
+                    self.op2_simple(i, p),
                 ),
 
             // Single Data Transfer - pre-indexing
@@ -721,9 +926,9 @@ impl Cpu {
                     b,
                     w == 1,
                     l,
-                    Registers::from(r),
-                    Registers::from(g),
-                    self.op2(i, p),
+                    RegisterType::from(r),
+                    RegisterType::from(g),
+                    self.op2_simple(i, p),
                 ),
 
             // halfword single data transfer - pre-indexing
@@ -732,8 +937,8 @@ impl Cpu {
                     u,
                     w == 1,
                     l,
-                    Registers::from(r),
-                    Registers::from(g),
+                    RegisterType::from(r),
+                    RegisterType::from(g),
                     self.halfword_transfer_offset(i == 1, j, s),
                 ),
 
@@ -742,8 +947,8 @@ impl Cpu {
                 .halfword_single_data_transfer_post(
                     u,
                     l,
-                    Registers::from(r),
-                    Registers::from(g),
+                    RegisterType::from(r),
+                    RegisterType::from(g),
                     self.halfword_transfer_offset(i == 1, j, s),
                 ),
 
@@ -753,7 +958,7 @@ impl Cpu {
                 s == 1,
                 w == 1,
                 l,
-                Registers::from(r),
+                RegisterType::from(r),
                 self.rlist(g as u16),
             ),
 
@@ -764,16 +969,16 @@ impl Cpu {
                     s == 1,
                     w == 1,
                     l,
-                    Registers::from(r),
+                    RegisterType::from(r),
                     self.rlist(g as u16),
                 ),
 
             // SWP
             "cccc0001_0b00rrrr_gggg0000_1001ffff" if self.guard(c) => self.swp(
                 b,
-                Registers::from(r),
-                Registers::from(g),
-                Registers::from(f),
+                RegisterType::from(r),
+                RegisterType::from(g),
+                RegisterType::from(f),
             ),
 
             // ALU
@@ -795,8 +1000,8 @@ impl Cpu {
                 self.alu(
                     o,
                     s == 1,
-                    Registers::from(r),
-                    Registers::from(g),
+                    RegisterType::from(r),
+                    RegisterType::from(g),
                     self.op2(i, p),
                 )
             }
@@ -812,10 +1017,10 @@ impl Cpu {
                 self.multiply(
                     o,
                     s == 1,
-                    Registers::from(r),
-                    Registers::from(g),
-                    Registers::from(f),
-                    Registers::from(h),
+                    RegisterType::from(r),
+                    RegisterType::from(g),
+                    RegisterType::from(f),
+                    RegisterType::from(h),
                 )
             }
 
@@ -828,127 +1033,127 @@ impl Cpu {
         #[bitmatch]
         match &opecode {
             // LSL
-            "00000sss_ssrrrggg" => self.thumb_lsl(Registers::from(r), Registers::from(g), s),
+            "00000sss_ssrrrggg" => self.thumb_lsl(RegisterType::from(r), RegisterType::from(g), s),
 
             // LSR
-            "00001sss_ssrrrggg" => self.thumb_lsr(Registers::from(r), Registers::from(g), s),
+            "00001sss_ssrrrggg" => self.thumb_lsr(RegisterType::from(r), RegisterType::from(g), s),
 
             // ASR
-            "00010sss_ssrrrggg" => self.thumb_asr(Registers::from(r), Registers::from(g), s),
+            "00010sss_ssrrrggg" => self.thumb_asr(RegisterType::from(r), RegisterType::from(g), s),
 
             // ADD r
             "0001100r_rrgggfff" => {
-                let val = self.r.get(Registers::from(r)) as u16;
+                let val = self.get_r(RegisterType::from(r)) as u16;
 
-                self.thumb_add(val, Registers::from(g), Registers::from(f))
+                self.thumb_add(val, RegisterType::from(g), RegisterType::from(f))
             }
 
             // ADD imm
-            "0001110i_iigggfff" => self.thumb_add(i, Registers::from(g), Registers::from(f)),
+            "0001110i_iigggfff" => self.thumb_add(i, RegisterType::from(g), RegisterType::from(f)),
 
             // SUB r
             "0001101r_rrgggfff" => {
-                let val = self.r.get(Registers::from(r)) as u16;
+                let val = self.get_r(RegisterType::from(r)) as u16;
 
-                self.thumb_sub(val, Registers::from(g), Registers::from(f))
+                self.thumb_sub(val, RegisterType::from(g), RegisterType::from(f))
             }
 
             // SUB imm
-            "0001111i_iigggfff" => self.thumb_sub(i, Registers::from(g), Registers::from(f)),
+            "0001111i_iigggfff" => self.thumb_sub(i, RegisterType::from(g), RegisterType::from(f)),
 
             // MOV
-            "00100rrr_nnnnnnnn" => self.thumb_mov(Registers::from(r), n),
+            "00100rrr_nnnnnnnn" => self.thumb_mov(RegisterType::from(r), n),
 
             // CMP
-            "00101rrr_nnnnnnnn" => self.thumb_cmp(Registers::from(r), n),
+            "00101rrr_nnnnnnnn" => self.thumb_cmp(RegisterType::from(r), n),
 
             // ADD MOV
-            "00110rrr_nnnnnnnn" => self.thumb_add_mov(Registers::from(r), n),
+            "00110rrr_nnnnnnnn" => self.thumb_add_mov(RegisterType::from(r), n),
 
             // SUB MOV
-            "00111rrr_nnnnnnnn" => self.thumb_sub_mov(Registers::from(r), n),
+            "00111rrr_nnnnnnnn" => self.thumb_sub_mov(RegisterType::from(r), n),
 
             // AND MOV
-            "01000000_00rrrggg" => self.thumb_and_mov(Registers::from(r), Registers::from(g)),
+            "01000000_00rrrggg" => self.thumb_and_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // EOR MOV
-            "01000000_01rrrggg" => self.thumb_eor_mov(Registers::from(r), Registers::from(g)),
+            "01000000_01rrrggg" => self.thumb_eor_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // LSL MOV
-            "01000000_10rrrggg" => self.thumb_lsl_mov(Registers::from(r), Registers::from(g)),
+            "01000000_10rrrggg" => self.thumb_lsl_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // LSR MOV
-            "01000000_11rrrggg" => self.thumb_lsr_mov(Registers::from(r), Registers::from(g)),
+            "01000000_11rrrggg" => self.thumb_lsr_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // ASR MOV
-            "01000001_00rrrggg" => self.thumb_asr_mov(Registers::from(r), Registers::from(g)),
+            "01000001_00rrrggg" => self.thumb_asr_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // ADC MOV
-            "01000001_01rrrggg" => self.thumb_adc_mov(Registers::from(r), Registers::from(g)),
+            "01000001_01rrrggg" => self.thumb_adc_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // SBC MOV
-            "01000001_10rrrggg" => self.thumb_sbc_mov(Registers::from(r), Registers::from(g)),
+            "01000001_10rrrggg" => self.thumb_sbc_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // ROR MOV
-            "01000001_11rrrggg" => self.thumb_ror_mov(Registers::from(r), Registers::from(g)),
+            "01000001_11rrrggg" => self.thumb_ror_mov(RegisterType::from(r), RegisterType::from(g)),
 
             // TST
-            "01000010_00rrrggg" => self.thumb_tst(Registers::from(r), Registers::from(g)),
+            "01000010_00rrrggg" => self.thumb_tst(RegisterType::from(r), RegisterType::from(g)),
 
             // NEG
-            "01000010_01rrrggg" => self.thumb_neg(Registers::from(r), Registers::from(g)),
+            "01000010_01rrrggg" => self.thumb_neg(RegisterType::from(r), RegisterType::from(g)),
 
             // CMP r
             "01000010_10rrrggg" => {
-                let n = self.r.get(Registers::from(g)) as u16;
+                let n = self.get_r(RegisterType::from(g)) as u16;
 
-                self.thumb_cmp(Registers::from(r), n)
+                self.thumb_cmp(RegisterType::from(r), n)
             }
 
             // CMN
-            "01000010_11rrrggg" => self.thumb_cmn(Registers::from(r), Registers::from(g)),
+            "01000010_11rrrggg" => self.thumb_cmn(RegisterType::from(r), RegisterType::from(g)),
 
             // ORR
-            "01000011_00rrrggg" => self.thumb_orr(Registers::from(r), Registers::from(g)),
+            "01000011_00rrrggg" => self.thumb_orr(RegisterType::from(r), RegisterType::from(g)),
 
             // MUL
-            "01000011_01rrrggg" => self.thumb_mul(Registers::from(r), Registers::from(g)),
+            "01000011_01rrrggg" => self.thumb_mul(RegisterType::from(r), RegisterType::from(g)),
 
             // BIC
-            "01000011_10rrrggg" => self.thumb_bic(Registers::from(r), Registers::from(g)),
+            "01000011_10rrrggg" => self.thumb_bic(RegisterType::from(r), RegisterType::from(g)),
 
             // MVN
-            "01000011_11rrrggg" => self.thumb_mvn(Registers::from(r), Registers::from(g)),
+            "01000011_11rrrggg" => self.thumb_mvn(RegisterType::from(r), RegisterType::from(g)),
 
             // hiR
             "010001oo_dsrrrggg" => {
                 let rs = if s == 1 {
-                    Registers::from(r + 8)
+                    RegisterType::from(r + 8)
                 } else {
-                    Registers::from(r)
+                    RegisterType::from(r)
                 };
                 let rd = if d == 1 {
-                    Registers::from(g + 8)
+                    RegisterType::from(g + 8)
                 } else {
-                    Registers::from(g)
+                    RegisterType::from(g)
                 };
 
                 match o {
                     // ADD
                     0b00 => {
-                        let val = self.r.get(rd) as u16;
+                        let val = self.get_r(rd) as u16;
 
                         self.thumb_add(val, rs, rd)
                     }
                     // CMP
                     0b01 => {
-                        let n = self.r.get(rs) as u16;
+                        let n = self.get_r(rs) as u16;
 
                         self.thumb_cmp(rd, n)
                     }
                     // MOV
                     0b10 => {
-                        let n = self.r.get(rs) as u16;
+                        let n = self.get_r(rs) as u16;
 
                         self.thumb_mov(rd, n)
                     }
@@ -960,26 +1165,26 @@ impl Cpu {
 
             // LDR relative
             "01001rrr_nnnnnnnn" => {
-                let addr = self.r.pc.wrapping_add(n as u32);
-                let rd = Registers::from(r);
+                let addr = self.pc.wrapping_add(n as u32);
+                let rd = RegisterType::from(r);
 
                 self.ldr(addr, 4, rd)
             }
 
             // Load/Store sign-extended byte halfword
             "01010oo_rrrbbbddd" => {
-                let ro = Registers::from(r);
-                let rb = Registers::from(b);
-                let rd = Registers::from(d);
+                let ro = RegisterType::from(r);
+                let rb = RegisterType::from(b);
+                let rd = RegisterType::from(d);
 
-                let base_addr = self.r.get(rb);
-                let offset = self.r.get(ro);
+                let base_addr = self.get_r(rb);
+                let offset = self.get_r(ro);
                 let addr = base_addr.wrapping_add(offset);
 
                 match o {
                     // STRH
                     0b00 => {
-                        let result = self.r.get(rd) as u16;
+                        let result = self.get_r(rd) as u16;
 
                         self.bus.write_16(addr, result)
                     }
@@ -987,7 +1192,7 @@ impl Cpu {
                     0b01 => {
                         let result = self.bus.read_8(addr)? as i8 as i16;
 
-                        self.r.set(rd, result as u32);
+                        self.set_r(rd, result as u32)?;
 
                         Ok(())
                     }
@@ -995,7 +1200,7 @@ impl Cpu {
                     0b10 => {
                         let result = self.bus.read_16(addr)? as u16;
 
-                        self.r.set(rd, result as u32);
+                        self.set_r(rd, result as u32)?;
 
                         Ok(())
                     }
@@ -1003,7 +1208,7 @@ impl Cpu {
                     0b11 => {
                         let result = self.bus.read_16(addr)? as i16 as i32;
 
-                        self.r.set(rd, result as u32);
+                        self.set_r(rd, result as u32)?;
 
                         Ok(())
                     }
@@ -1013,24 +1218,24 @@ impl Cpu {
 
             // load store with register offset
             "0101oo0_rrrbbbddd" => {
-                let ro = Registers::from(r);
-                let rb = Registers::from(b);
-                let rd = Registers::from(d);
+                let ro = RegisterType::from(r);
+                let rb = RegisterType::from(b);
+                let rd = RegisterType::from(d);
 
-                let base_addr = self.r.get(rb);
-                let offset = self.r.get(ro);
+                let base_addr = self.get_r(rb);
+                let offset = self.get_r(ro);
                 let addr = base_addr.wrapping_add(offset);
 
                 match o {
                     // STR
                     0b00 => {
-                        let result = self.r.get(rd);
+                        let result = self.get_r(rd);
 
                         self.bus.write_32(addr, result)
                     }
                     // STRB
                     0b01 => {
-                        let result = self.r.get(rd) as u8;
+                        let result = self.get_r(rd) as u8;
 
                         self.bus.write_8(addr, result)
                     }
@@ -1038,7 +1243,7 @@ impl Cpu {
                     0b10 => {
                         let result = self.bus.read_32(addr)?;
 
-                        self.r.set(rd, result);
+                        self.set_r(rd, result)?;
 
                         Ok(())
                     }
@@ -1046,7 +1251,7 @@ impl Cpu {
                     0b11 => {
                         let result = self.bus.read_8(addr)?;
 
-                        self.r.set(rd, result as u32);
+                        self.set_r(rd, result as u32)?;
 
                         Ok(())
                     }
@@ -1056,16 +1261,16 @@ impl Cpu {
 
             // load/store with immediate offset
             "011oonnn_nnbbbddd" => {
-                let rb = Registers::from(b);
-                let rd = Registers::from(d);
+                let rb = RegisterType::from(b);
+                let rd = RegisterType::from(d);
 
-                let base_addr = self.r.get(rb);
+                let base_addr = self.get_r(rb);
                 let addr = base_addr.wrapping_add(n as u32);
 
                 match o {
                     // STR
                     0b00 => {
-                        let result = self.r.get(rd);
+                        let result = self.get_r(rd);
 
                         self.bus.write_32(addr, result)
                     }
@@ -1073,13 +1278,13 @@ impl Cpu {
                     0b01 => {
                         let result = self.bus.read_32(addr)?;
 
-                        self.r.set(rd, result);
+                        self.set_r(rd, result)?;
 
                         Ok(())
                     }
                     // STRB
                     0b10 => {
-                        let result = self.r.get(rd) as u8;
+                        let result = self.get_r(rd) as u8;
 
                         self.bus.write_8(addr, result)
                     }
@@ -1087,7 +1292,7 @@ impl Cpu {
                     0b11 => {
                         let result = self.bus.read_8(addr)?;
 
-                        self.r.set(rd, result as u32);
+                        self.set_r(rd, result as u32)?;
 
                         Ok(())
                     }
@@ -1097,16 +1302,16 @@ impl Cpu {
 
             // load/store halfword
             "1000onnn_nnbbbddd" => {
-                let rb = Registers::from(b);
-                let rd = Registers::from(d);
+                let rb = RegisterType::from(b);
+                let rd = RegisterType::from(d);
 
-                let base_addr = self.r.get(rb);
+                let base_addr = self.get_r(rb);
                 let addr = base_addr.wrapping_add(n as u32);
 
                 match o {
                     // STRH
                     0b0 => {
-                        let result = self.r.get(rd) as u16;
+                        let result = self.get_r(rd) as u16;
 
                         self.bus.write_16(addr, result)
                     }
@@ -1114,7 +1319,7 @@ impl Cpu {
                     0b1 => {
                         let result = self.bus.read_16(addr)?;
 
-                        self.r.set(rd, result as u32);
+                        self.set_r(rd, result as u32)?;
 
                         Ok(())
                     }
@@ -1124,15 +1329,15 @@ impl Cpu {
 
             // load/store SP-relative
             "1001orrr_nnnnnnnn" => {
-                let rd = Registers::from(r);
+                let rd = RegisterType::from(r);
 
-                let base_addr = self.r.get(Registers::SP);
+                let base_addr = self.get_r(RegisterType::SP);
                 let addr = base_addr.wrapping_add(n as u32);
 
                 match o {
                     // STR
                     0b0 => {
-                        let result = self.r.get(rd);
+                        let result = self.get_r(rd);
 
                         self.bus.write_32(addr, result)
                     }
@@ -1140,7 +1345,7 @@ impl Cpu {
                     0b1 => {
                         let result = self.bus.read_32(addr)?;
 
-                        self.r.set(rd, result);
+                        self.set_r(rd, result)?;
 
                         Ok(())
                     }
@@ -1150,18 +1355,18 @@ impl Cpu {
 
             // get relative address
             "1010orrr_nnnnnnnn" => {
-                let rd = Registers::from(r);
+                let rd = RegisterType::from(r);
 
                 match o {
                     0b0 => {
-                        let val = (self.r.pc.wrapping_add(4) & !2u32).wrapping_add(n as u32);
-                        self.r.set(rd, val);
+                        let val = (self.pc & !2u32).wrapping_add(n as u32 * 4);
+                        self.set_r(rd, val)?;
 
                         Ok(())
                     }
                     0b1 => {
-                        let val = self.r.get(Registers::SP).wrapping_add(n as u32);
-                        self.r.set(rd, val);
+                        let val = self.get_r(RegisterType::SP).wrapping_add(n as u32 * 4);
+                        self.set_r(rd, val)?;
 
                         Ok(())
                     }
@@ -1171,7 +1376,7 @@ impl Cpu {
 
             // add offset to stack pointer
             "10110000_onnnnnnn" => {
-                let mut result = self.r.get(Registers::SP);
+                let mut result = self.get_r(RegisterType::SP);
 
                 if o == 1 {
                     result = result.wrapping_sub(n as u32);
@@ -1179,7 +1384,7 @@ impl Cpu {
                     result = result.wrapping_add(n as u32);
                 };
 
-                self.r.set(Registers::SP, result);
+                self.set_r(RegisterType::SP, result)?;
 
                 Ok(())
             }
@@ -1192,7 +1397,7 @@ impl Cpu {
                     // PUSH
                     0b0 => {
                         if s == 1 {
-                            registers.push(Registers::LR);
+                            registers.push(RegisterType::LR);
                         }
 
                         self.thumb_push(registers)
@@ -1200,10 +1405,12 @@ impl Cpu {
                     // POP
                     0b1 => {
                         if s == 1 {
-                            registers.push(Registers::PC);
+                            registers.push(RegisterType::PC);
                         }
 
-                        self.thumb_pop(registers)
+                        self.thumb_pop(registers)?;
+
+                        Ok(())
                     }
                     _ => bail!("invalid push pop registers opcode"),
                 }
@@ -1211,7 +1418,7 @@ impl Cpu {
 
             // multiple load/store
             "1100obbb_nnnnnnnn" => {
-                let rb = Registers::from(b);
+                let rb = RegisterType::from(b);
                 let registers = self.rlist_low(n as u8);
 
                 match o {
@@ -1255,53 +1462,64 @@ impl Cpu {
     }
 
     fn b(&mut self, nn: i32) -> Result<()> {
-        self.r.pc = self.r.pc.wrapping_add(4);
-        self.r.pc = self.r.pc.wrapping_add((nn * 4) as u32);
+        self.pc = self.pc.wrapping_add((nn * 4) as u32);
+
+        self.refresh_prefetch()?;
 
         Ok(())
     }
 
     fn bl(&mut self, nn: i32) -> Result<()> {
-        self.r.set(Registers::LR, self.r.pc);
+        self.set_r(RegisterType::LR, self.pc.wrapping_sub(4))?;
 
-        self.r.pc = self.r.pc.wrapping_add(4);
-        self.r.pc = self.r.pc.wrapping_add((nn * 4) as u32);
+        self.pc = self.pc.wrapping_add((nn * 4) as u32);
+
+        self.refresh_prefetch()?;
 
         Ok(())
     }
 
-    fn bx(&mut self, r: Registers) -> Result<()> {
-        let val = self.r.get(r);
+    fn bx(&mut self, r: RegisterType) -> Result<()> {
+        let val = self.get_r(r);
 
         if val & 1 == 1 {
-            self.r.pc = val - 1;
-            self.r.cpsr.set_t(true);
+            self.pc = val - 1;
+            self.cpsr.set_t(true);
         } else {
-            self.r.pc = val;
-            self.r.cpsr.set_t(false);
+            self.pc = val;
+            self.cpsr.set_t(false);
         }
+
+        self.refresh_prefetch()?;
 
         Ok(())
     }
 
     fn swi(&mut self) -> Result<()> {
-        unimplemented!("SWI");
+        self.refresh_prefetch()?;
+        debug!("SWI");
+
+        Ok(())
     }
 
     fn bkpt(&mut self) -> Result<()> {
-        unimplemented!("BKPT");
+        debug!("BKPT");
+
+        Ok(())
     }
 
     fn und(&mut self) -> Result<()> {
-        unimplemented!("UND");
+        debug!("UND");
+
+        Ok(())
     }
 
     fn alu(
         &mut self,
         opcode: u32,
         state: bool,
-        rn: Registers,
-        rd: Registers,
+        rn: RegisterType,
+        rd: RegisterType,
         op2: (u32, Option<bool>),
     ) -> Result<()> {
         let cpsr = match opcode {
@@ -1341,28 +1559,46 @@ impl Cpu {
         }?;
 
         if state {
-            self.r.cpsr = cpsr;
+            let orig_t = self.cpsr.t();
+
+            self.cpsr = cpsr;
+
+            if self.cpsr.t() != orig_t {
+                self.refresh_prefetch()?;
+            }
         }
 
         Ok(())
+    }
+
+    fn _alu_pc_special_if_needed(&self, rd: RegisterType) -> Option<Psr> {
+        if rd == RegisterType::PC {
+            Some(self.get_spsr())
+        } else {
+            None
+        }
     }
 
     fn _alu_logical<Operation>(
         &mut self,
         left: u32,
         right: u32,
-        rd: Registers,
+        rd: RegisterType,
         c: Option<bool>,
         f: Operation,
-    ) -> Result<PSR>
+    ) -> Result<Psr>
     where
         Operation: Fn(u32, u32) -> u32,
     {
         let result = f(left, right);
 
-        self.r.set(rd, result);
+        self.set_r(rd, result)?;
 
-        let mut cpsr = self.r.cpsr;
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
+
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         if let Some(c) = c {
@@ -1376,17 +1612,21 @@ impl Cpu {
         &mut self,
         left: u32,
         right: u32,
-        rd: Registers,
+        rd: RegisterType,
         f: Operation,
-    ) -> Result<PSR>
+    ) -> Result<Psr>
     where
         Operation: Fn(u32, u32) -> u32,
     {
         let result = f(left, right);
 
-        self.r.set(rd, result);
+        self.set_r(rd, result)?;
 
-        let mut cpsr = self.r.cpsr;
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
+
+        let mut cpsr = self.cpsr;
         cpsr.set_pl_nzcv_by(left, right);
 
         Ok(cpsr)
@@ -1396,17 +1636,21 @@ impl Cpu {
         &mut self,
         left: u32,
         right: u32,
-        rd: Registers,
+        rd: RegisterType,
         f: Operation,
-    ) -> Result<PSR>
+    ) -> Result<Psr>
     where
         Operation: Fn(u32, u32) -> u32,
     {
         let result = f(left, right);
 
-        self.r.set(rd, result);
+        self.set_r(rd, result)?;
 
-        let mut cpsr = self.r.cpsr;
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
+
+        let mut cpsr = self.cpsr;
         cpsr.set_ng_nzcv_by(left, right);
 
         Ok(cpsr)
@@ -1418,13 +1662,13 @@ impl Cpu {
         right: u32,
         c: Option<bool>,
         f: Operation,
-    ) -> Result<PSR>
+    ) -> Result<Psr>
     where
         Operation: Fn(u32, u32) -> u32,
     {
         let result = f(left, right);
 
-        let mut cpsr = self.r.cpsr;
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         if let Some(c) = c {
@@ -1434,45 +1678,79 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn and(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left & right)
+    fn and(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, c): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left & right)
     }
 
-    fn eor(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left ^ right)
+    fn eor(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, c): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left ^ right)
     }
 
-    fn sub(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_arit_ng(self.r.get(rn), op2, rd, |left, right| {
+    fn sub(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, _): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._alu_arit_ng(self.get_r(rn), op2, rd, |left, right| {
             left.wrapping_sub(right)
         })
     }
 
-    fn rsb(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_arit_ng(op2, self.r.get(rn), rd, |left, right| {
+    fn rsb(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, _): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._alu_arit_ng(op2, self.get_r(rn), rd, |left, right| {
             left.wrapping_sub(right)
         })
     }
 
-    fn add(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_arit_pl(self.r.get(rn), op2, rd, |left, right| {
+    fn add(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, _): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._alu_arit_pl(self.get_r(rn), op2, rd, |left, right| {
             left.wrapping_add(right)
         })
     }
 
-    fn adc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        let val1 = self.r.get(rn);
+    fn adc(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, _): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        let val1 = self.get_r(rn);
         let val2 = op2;
-        let val3 = self.r.cpsr.c() as u32;
+        let val3 = self.cpsr.c() as u32;
 
         let (result1, c1) = val1.overflowing_add(val2);
         let (result2, c2) = result1.overflowing_add(val3);
         let v1 = val1.is_overflow_add(val2);
         let v2 = result1.is_overflow_add(val3);
 
-        self.r.set(rd, result2);
+        self.set_r(rd, result2)?;
 
-        let mut cpsr = self.r.cpsr;
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
+
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result2);
         cpsr.set_c(c1 | c2);
         cpsr.set_v(v1 | v2);
@@ -1480,19 +1758,23 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn _sbc(&mut self, left: u32, right: u32, rd: Registers) -> Result<PSR> {
+    fn _sbc(&mut self, left: u32, right: u32, rd: RegisterType) -> Result<Psr> {
         let val1 = left;
         let val2 = right;
-        let val3 = !self.r.cpsr.c() as u32;
+        let val3 = !self.cpsr.c() as u32;
 
         let (result1, c1) = val1.overflowing_sub(val2);
         let (result2, c2) = result1.overflowing_sub(val3);
         let v1 = val1.is_overflow_sub(val2);
         let v2 = result1.is_overflow_sub(val3);
 
-        self.r.set(rd, result2);
+        self.set_r(rd, result2)?;
 
-        let mut cpsr = self.r.cpsr;
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
+
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result2);
         cpsr.set_c(!c1 & !c2);
         cpsr.set_v(v1 | v2);
@@ -1500,55 +1782,76 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn sbc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        self._sbc(self.r.get(rn), op2, rd)
+    fn sbc(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, _): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._sbc(self.get_r(rn), op2, rd)
     }
 
-    fn rsc(&mut self, rn: Registers, rd: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        self._sbc(op2, self.r.get(rn), rd)
+    fn rsc(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, _): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._sbc(op2, self.get_r(rn), rd)
     }
 
-    fn tst(&mut self, rn: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_test(self.r.get(rn), op2, c, |left, right| left & right)
+    fn tst(&mut self, rn: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
+        self._alu_test(self.get_r(rn), op2, c, |left, right| left & right)
     }
 
-    fn teq(&mut self, rn: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_test(self.r.get(rn), op2, c, |left, right| left ^ right)
+    fn teq(&mut self, rn: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
+        self._alu_test(self.get_r(rn), op2, c, |left, right| left ^ right)
     }
 
-    fn cmp(&mut self, rn: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        let left = self.r.get(rn);
+    fn cmp(&mut self, rn: RegisterType, (op2, _): (u32, Option<bool>)) -> Result<Psr> {
+        let left = self.get_r(rn);
         let right = op2;
 
-        let mut cpsr = self.r.cpsr;
-        cpsr.set_ng_nzc_by(left, right);
+        let mut cpsr = self.cpsr;
+        cpsr.set_ng_nzcv_by(left, right);
 
         Ok(cpsr)
     }
 
-    fn cmn(&mut self, rn: Registers, (op2, _): (u32, Option<bool>)) -> Result<PSR> {
-        let left = self.r.get(rn);
+    fn cmn(&mut self, rn: RegisterType, (op2, _): (u32, Option<bool>)) -> Result<Psr> {
+        let left = self.get_r(rn);
         let right = op2;
 
-        let mut cpsr = self.r.cpsr;
-        cpsr.set_pl_nzc_by(left, right);
+        let mut cpsr = self.cpsr;
+        cpsr.set_pl_nzcv_by(left, right);
 
         Ok(cpsr)
     }
 
-    fn orr(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left | right)
+    fn orr(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, c): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left | right)
     }
 
-    fn mov(&mut self, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
+    fn mov(&mut self, rd: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
+        // trace!("MOV rd: {:?} = op2 {:08X}", rd, op2);
         self._alu_logical(op2, 0, rd, c, |left, _| left)
     }
 
-    fn bic(&mut self, rn: Registers, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
-        self._alu_logical(self.r.get(rn), op2, rd, c, |left, right| left & !right)
+    fn bic(
+        &mut self,
+        rn: RegisterType,
+        rd: RegisterType,
+        (op2, c): (u32, Option<bool>),
+    ) -> Result<Psr> {
+        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left & !right)
     }
 
-    fn mvn(&mut self, rd: Registers, (op2, c): (u32, Option<bool>)) -> Result<PSR> {
+    fn mvn(&mut self, rd: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
         self._alu_logical(op2, 0, rd, c, |left, _| !left)
     }
 
@@ -1556,10 +1859,10 @@ impl Cpu {
         &mut self,
         opcode: u32,
         state: bool,
-        rd: Registers,
-        rn: Registers,
-        rs: Registers,
-        rm: Registers,
+        rd: RegisterType,
+        rn: RegisterType,
+        rs: RegisterType,
+        rm: RegisterType,
     ) -> Result<()> {
         let cpsr = match opcode {
             // MUL
@@ -1578,121 +1881,143 @@ impl Cpu {
         }?;
 
         if state {
-            self.r.cpsr = cpsr;
+            self.cpsr = cpsr;
         }
 
         Ok(())
     }
 
-    fn mul(&mut self, rd: Registers, rm: Registers, rs: Registers) -> Result<PSR> {
-        let left = self.r.get(rm);
-        let right = self.r.get(rs);
+    fn mul(&mut self, rd: RegisterType, rm: RegisterType, rs: RegisterType) -> Result<Psr> {
+        let left = self.get_r(rm);
+        let right = self.get_r(rs);
 
         let result = left.wrapping_mul(right);
 
-        self.r.set(rd, result);
+        self.set_r(rd, result)?;
 
-        let mut cpsr = self.r.cpsr;
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         Ok(cpsr)
     }
 
-    fn mla(&mut self, rd: Registers, rn: Registers, rm: Registers, rs: Registers) -> Result<PSR> {
-        let left = self.r.get(rm);
-        let right = self.r.get(rs);
-        let add = self.r.get(rn);
+    fn mla(
+        &mut self,
+        rd: RegisterType,
+        rn: RegisterType,
+        rm: RegisterType,
+        rs: RegisterType,
+    ) -> Result<Psr> {
+        let left = self.get_r(rm);
+        let right = self.get_r(rs);
+        let add = self.get_r(rn);
 
         let result = add.wrapping_add(left.wrapping_mul(right));
 
-        self.r.set(rd, result);
+        self.set_r(rd, result)?;
 
-        let mut cpsr = self.r.cpsr;
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         Ok(cpsr)
     }
 
-    fn umull(&mut self, rd: Registers, rn: Registers, rm: Registers, rs: Registers) -> Result<PSR> {
-        let left = self.r.get(rm) as u64;
-        let right = self.r.get(rs) as u64;
+    fn umull(
+        &mut self,
+        rd: RegisterType,
+        rn: RegisterType,
+        rm: RegisterType,
+        rs: RegisterType,
+    ) -> Result<Psr> {
+        let left = self.get_r(rm) as u64;
+        let right = self.get_r(rs) as u64;
 
         let result = left.wrapping_mul(right);
 
-        self.r.set(rd, (result >> 32) as u32);
-        self.r.set(rn, result as u32);
+        self.set_r(rd, (result >> 32) as u32)?;
+        self.set_r(rn, result as u32)?;
 
-        let mut cpsr = self.r.cpsr;
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         Ok(cpsr)
     }
 
-    fn umlal(&mut self, rd: Registers, rn: Registers, rm: Registers, rs: Registers) -> Result<PSR> {
-        let left = self.r.get(rm) as u64;
-        let right = self.r.get(rs) as u64;
-        let add = ((self.r.get(rd) as u64) << 32) | (self.r.get(rn) as u64);
+    fn umlal(
+        &mut self,
+        rd: RegisterType,
+        rn: RegisterType,
+        rm: RegisterType,
+        rs: RegisterType,
+    ) -> Result<Psr> {
+        let left = self.get_r(rm) as u64;
+        let right = self.get_r(rs) as u64;
+        let add = ((self.get_r(rd) as u64) << 32) | (self.get_r(rn) as u64);
 
         let result = add.wrapping_add(left.wrapping_mul(right));
 
-        self.r.set(rd, (result >> 32) as u32);
-        self.r.set(rn, result as u32);
+        self.set_r(rd, (result >> 32) as u32)?;
+        self.set_r(rn, result as u32)?;
 
-        let mut cpsr = self.r.cpsr;
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         Ok(cpsr)
     }
 
-    fn smull(&mut self, rd: Registers, rn: Registers, rm: Registers, rs: Registers) -> Result<PSR> {
-        let left = self.r.get(rm) as i64;
-        let right = self.r.get(rs) as i64;
+    fn smull(
+        &mut self,
+        rd: RegisterType,
+        rn: RegisterType,
+        rm: RegisterType,
+        rs: RegisterType,
+    ) -> Result<Psr> {
+        let left = self.get_r(rm) as i64;
+        let right = self.get_r(rs) as i64;
 
         let result = left.wrapping_mul(right);
 
-        self.r.set(rd, (result >> 32) as u32);
-        self.r.set(rn, result as u32);
+        self.set_r(rd, (result >> 32) as u32)?;
+        self.set_r(rn, result as u32)?;
 
-        let mut cpsr = self.r.cpsr;
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         Ok(cpsr)
     }
 
-    fn smlal(&mut self, rd: Registers, rn: Registers, rm: Registers, rs: Registers) -> Result<PSR> {
-        let left = self.r.get(rm) as i64;
-        let right = self.r.get(rs) as i64;
-        let add = (((self.r.get(rd) as u64) << 32) | (self.r.get(rn) as u64)) as i64;
+    fn smlal(
+        &mut self,
+        rd: RegisterType,
+        rn: RegisterType,
+        rm: RegisterType,
+        rs: RegisterType,
+    ) -> Result<Psr> {
+        let left = self.get_r(rm) as i64;
+        let right = self.get_r(rs) as i64;
+        let add = (((self.get_r(rd) as u64) << 32) | (self.get_r(rn) as u64)) as i64;
 
         let result = add.wrapping_add(left.wrapping_mul(right));
 
-        self.r.set(rd, (result >> 32) as u32);
-        self.r.set(rn, result as u32);
+        self.set_r(rd, (result >> 32) as u32)?;
+        self.set_r(rn, result as u32)?;
 
-        let mut cpsr = self.r.cpsr;
+        let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
         Ok(cpsr)
     }
 
-    fn mrs(&mut self, p: u32, r: Registers) -> Result<()> {
-        let psr = if p == 0 {
-            self.r.cpsr
-        } else {
-            self.r.get_spsr()
-        };
+    fn mrs(&mut self, p: u32, r: RegisterType) -> Result<()> {
+        let psr = if p == 0 { self.cpsr } else { self.get_spsr() };
 
-        self.r.set(r, psr.0);
+        self.set_r(r, psr.0)?;
 
         Ok(())
     }
 
-    fn msr(&mut self, p: u32, f: bool, _s: bool, _x: bool, t: bool, val: PSR) -> Result<()> {
-        let mut psr = if p == 0 {
-            self.r.cpsr
-        } else {
-            self.r.get_spsr()
-        };
+    fn msr(&mut self, p: u32, f: bool, _s: bool, _x: bool, t: bool, val: Psr) -> Result<()> {
+        let mut psr = if p == 0 { self.cpsr } else { self.get_spsr() };
 
         if f {
             psr.set_n(val.n());
@@ -1701,22 +2026,29 @@ impl Cpu {
             psr.set_v(val.v());
         }
 
-        if t && psr.mode() == Mode::Supervisor {
+        if t && psr.mode() != Mode::User {
             psr.set_i(val.i());
             psr.set_f(val.f());
             psr.set_t(val.t());
+            psr.set_mode(val.mode().into());
         }
 
         if p == 0 {
-            self.r.cpsr = psr;
+            let orig_t = self.cpsr.t();
+
+            self.cpsr = psr;
+
+            if self.cpsr.t() != orig_t {
+                self.refresh_prefetch()?;
+            }
         } else {
-            self.r.set_spsr(psr);
+            self.set_spsr(psr);
         };
 
         Ok(())
     }
 
-    fn ldr(&mut self, addr: u32, size: u32, rd: Registers) -> Result<()> {
+    fn ldr(&mut self, addr: u32, size: u32, rd: RegisterType) -> Result<()> {
         let result = match size {
             1 => self.bus.read_8(addr)? as u32,
             2 => self.bus.read_16(addr)? as u32,
@@ -1724,27 +2056,26 @@ impl Cpu {
             _ => bail!("invalid byte size"),
         };
 
-        self.r.set(rd, result);
+        self.set_r(rd, result)?;
 
         Ok(())
     }
 
-    fn str(&mut self, addr: u32, size: u32, rd: Registers) -> Result<()> {
+    fn str(&mut self, addr: u32, size: u32, rd: RegisterType) -> Result<()> {
         match size {
             1 => {
-                let result = self.r.get(rd) as u8;
-                self.bus.write_8(addr, result)
+                self.bus.write_8(addr, self.get_r(rd) as u8)?;
             }
             2 => {
-                let result = self.r.get(rd) as u16;
-                self.bus.write_16(addr, result)
+                self.bus.write_16(addr, self.get_r(rd) as u16)?;
             }
             4 => {
-                let result = self.r.get(rd);
-                self.bus.write_32(addr, result)
+                self.bus.write_32(addr, self.get_r(rd) as u32)?;
             }
             _ => bail!("invalid byte size"),
         }
+
+        Ok(())
     }
 
     fn single_data_transfer_pre(
@@ -1753,15 +2084,17 @@ impl Cpu {
         byte_word: u32,
         writeback: bool,
         load_store: u32,
-        rn: Registers,
-        rd: Registers,
+        rn: RegisterType,
+        rd: RegisterType,
         (offset, _): (u32, Option<bool>),
     ) -> Result<()> {
-        let base_addr = self.r.get(rn);
+        let base_addr = self.get_r(rn);
 
         let addr = if up_down == 1 {
+            // up: add to base addr
             base_addr.wrapping_add(offset)
         } else {
+            // down: subtract from base addr
             base_addr.wrapping_sub(offset)
         };
 
@@ -1774,7 +2107,7 @@ impl Cpu {
         }
 
         if writeback {
-            self.r.set(rn, addr);
+            self.set_r(rn, addr)?;
         }
 
         Ok(())
@@ -1786,11 +2119,11 @@ impl Cpu {
         byte_word: u32,
         _memory: u32,
         load_store: u32,
-        rn: Registers,
-        rd: Registers,
+        rn: RegisterType,
+        rd: RegisterType,
         (offset, _): (u32, Option<bool>),
     ) -> Result<()> {
-        let addr = self.r.get(rn);
+        let addr = self.get_r(rn);
 
         let size = if byte_word == 1 { 1 } else { 4 };
 
@@ -1806,7 +2139,7 @@ impl Cpu {
             addr.wrapping_sub(offset)
         };
 
-        self.r.set(rn, new_addr);
+        self.set_r(rn, new_addr)?;
 
         Ok(())
     }
@@ -1815,7 +2148,7 @@ impl Cpu {
         if immediate {
             (upper as u32) << 4 | (lower as u32)
         } else {
-            self.r.get(Registers::from(lower))
+            self.get_r(RegisterType::from(lower))
         }
     }
 
@@ -1824,11 +2157,11 @@ impl Cpu {
         up_down: u32,
         writeback: bool,
         load_store: u32,
-        rn: Registers,
-        rd: Registers,
+        rn: RegisterType,
+        rd: RegisterType,
         offset: u32,
     ) -> Result<()> {
-        let base_addr = self.r.get(rn);
+        let base_addr = self.get_r(rn);
 
         let addr = if up_down == 1 {
             base_addr.wrapping_add(offset)
@@ -1843,7 +2176,7 @@ impl Cpu {
         }
 
         if writeback {
-            self.r.set(rn, addr);
+            self.set_r(rn, addr)?;
         }
 
         Ok(())
@@ -1853,11 +2186,11 @@ impl Cpu {
         &mut self,
         up_down: u32,
         load_store: u32,
-        rn: Registers,
-        rd: Registers,
+        rn: RegisterType,
+        rd: RegisterType,
         offset: u32,
     ) -> Result<()> {
-        let addr = self.r.get(rn);
+        let addr = self.get_r(rn);
 
         if load_store == 1 {
             self.ldr(addr, 2, rd)?;
@@ -1871,7 +2204,7 @@ impl Cpu {
             addr.wrapping_sub(offset)
         };
 
-        self.r.set(rn, new_addr);
+        self.set_r(rn, new_addr)?;
 
         Ok(())
     }
@@ -1882,12 +2215,12 @@ impl Cpu {
         _state: bool,
         writeback: bool,
         load_store: u32,
-        rn: Registers,
-        rlist: Vec<Registers>,
+        rn: RegisterType,
+        rlist: Vec<RegisterType>,
     ) -> Result<()> {
         // trace!("Block Data Transfer Pre-Indexing");
 
-        let base_addr = self.r.get(rn);
+        let base_addr = self.get_r(rn);
         let mut offset: i32 = 0;
 
         let mut rlist = rlist.clone();
@@ -1913,7 +2246,7 @@ impl Cpu {
         }
 
         if writeback {
-            self.r.set(rn, ((base_addr as i32) + offset) as u32);
+            self.set_r(rn, ((base_addr as i32) + offset) as u32)?;
         }
 
         Ok(())
@@ -1925,12 +2258,12 @@ impl Cpu {
         _state: bool,
         writeback: bool,
         load_store: u32,
-        rn: Registers,
-        rlist: Vec<Registers>,
+        rn: RegisterType,
+        rlist: Vec<RegisterType>,
     ) -> Result<()> {
         // trace!("Block Data Transfer Post-Indexing");
 
-        let base_addr = self.r.get(rn);
+        let base_addr = self.get_r(rn);
         let mut offset: i32 = 0;
 
         let mut rlist = rlist.clone();
@@ -1956,15 +2289,21 @@ impl Cpu {
         }
 
         if writeback {
-            self.r.set(rn, ((base_addr as i32) + offset) as u32);
+            self.set_r(rn, ((base_addr as i32) + offset) as u32)?;
         }
 
         Ok(())
     }
 
-    fn swp(&mut self, byte_word: u32, rn: Registers, rd: Registers, rm: Registers) -> Result<()> {
-        let addr = self.r.get(rn);
-        let source = self.r.get(rm);
+    fn swp(
+        &mut self,
+        byte_word: u32,
+        rn: RegisterType,
+        rd: RegisterType,
+        rm: RegisterType,
+    ) -> Result<()> {
+        let addr = self.get_r(rn);
+        let source = self.get_r(rm);
 
         let result = if byte_word == 1 {
             self.bus.read_8(addr)? as u32
@@ -1978,365 +2317,371 @@ impl Cpu {
             self.bus.write_32(addr, source)?;
         }
 
-        self.r.set(rd, result);
+        self.set_r(rd, result)?;
 
         Ok(())
     }
 
-    fn thumb_lsl(&mut self, rs: Registers, rd: Registers, offset: u16) -> Result<()> {
-        let source = self.r.get(rs) as u16;
+    fn thumb_lsl(&mut self, rs: RegisterType, rd: RegisterType, offset: u16) -> Result<()> {
+        let source = self.get_r(rs) as u16;
 
         let (result, c) = source.overflowing_shl(offset as u32);
 
-        self.r.set(rd, result as u32);
+        self.set_r(rd, result as u32)?;
 
-        self.r.cpsr.set_nz_by(result);
-        self.r.cpsr.set_c(c);
+        self.cpsr.set_nz_by(result);
+        self.cpsr.set_c(c);
 
         Ok(())
     }
 
-    fn thumb_lsr(&mut self, rs: Registers, rd: Registers, offset: u16) -> Result<()> {
-        let source = self.r.get(rs) as u16;
+    fn thumb_lsr(&mut self, rs: RegisterType, rd: RegisterType, offset: u16) -> Result<()> {
+        let source = self.get_r(rs) as u16;
 
         let (result, c) = source.overflowing_shr(offset as u32);
 
-        self.r.set(rd, result as u32);
+        self.set_r(rd, result as u32)?;
 
-        self.r.cpsr.set_nz_by(result);
-        self.r.cpsr.set_c(c);
+        self.cpsr.set_nz_by(result);
+        self.cpsr.set_c(c);
 
         Ok(())
     }
 
-    fn thumb_asr(&mut self, rs: Registers, rd: Registers, offset: u16) -> Result<()> {
-        let source = self.r.get(rs) as i16;
+    fn thumb_asr(&mut self, rs: RegisterType, rd: RegisterType, offset: u16) -> Result<()> {
+        let source = self.get_r(rs) as i16;
 
         let (result, c) = source.overflowing_shr(offset as u32);
 
-        self.r.set(rd, result as u32);
+        self.set_r(rd, result as u32)?;
 
-        self.r.cpsr.set_nz_by(result);
-        self.r.cpsr.set_c(c);
+        self.cpsr.set_nz_by(result);
+        self.cpsr.set_c(c);
 
         Ok(())
     }
 
-    fn thumb_add(&mut self, val: u16, rs: Registers, rd: Registers) -> Result<()> {
-        let left = self.r.get(rs) as u16;
+    fn thumb_add(&mut self, val: u16, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rs) as u16;
         let right = val;
         let result = left.wrapping_add(right);
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_pl_nzcv_by(left, right);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_pl_nzcv_by(left, right);
+
+        trace!("THUMB ADD {:04X} + {:04X} = {:04X}", left, right, result);
 
         Ok(())
     }
 
-    fn thumb_sub(&mut self, val: u16, rs: Registers, rd: Registers) -> Result<()> {
-        let left = self.r.get(rs) as u16;
+    fn thumb_sub(&mut self, val: u16, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rs) as u16;
         let right = val;
         let result = left.wrapping_sub(right);
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_ng_nzcv_by(left, right);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_ng_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_mov(&mut self, rd: Registers, n: u16) -> Result<()> {
+    fn thumb_mov(&mut self, rd: RegisterType, n: u16) -> Result<()> {
         let result = n as u16;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_cmp(&mut self, rd: Registers, n: u16) -> Result<()> {
-        let left = self.r.get(rd) as u16;
+    fn thumb_cmp(&mut self, rd: RegisterType, n: u16) -> Result<()> {
+        let left = self.get_r(rd) as u16;
         let right = n as u16;
 
-        self.r.cpsr.set_ng_nzcv_by(left, right);
+        self.cpsr.set_ng_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_add_mov(&mut self, rd: Registers, n: u16) -> Result<()> {
-        let left = self.r.get(rd);
+    fn thumb_add_mov(&mut self, rd: RegisterType, n: u16) -> Result<()> {
+        let left = self.get_r(rd);
         let right = n as u32;
         let result = left.wrapping_add(right);
 
-        self.r.set(rd, result);
-        self.r.cpsr.set_pl_nzcv_by(left, right);
+        self.set_r(rd, result)?;
+        self.cpsr.set_pl_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_sub_mov(&mut self, rd: Registers, n: u16) -> Result<()> {
-        let left = self.r.get(rd) as u16;
+    fn thumb_sub_mov(&mut self, rd: RegisterType, n: u16) -> Result<()> {
+        let left = self.get_r(rd) as u16;
         let right = n as u16;
         let result = left.wrapping_sub(right);
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_ng_nzcv_by(left, right);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_ng_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_and_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_and_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left & right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_eor_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_eor_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left ^ right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_lsl_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_lsl_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left << right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_lsr_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_lsr_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left >> right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_asr_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as i16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_asr_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as i16;
+        let right = self.get_r(rs) as u16;
         let result = left >> right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_adc_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
-        let c = self.r.cpsr.c() as u16;
+    fn thumb_adc_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
+        let c = self.cpsr.c() as u16;
 
         let (result1, c1) = left.overflowing_add(right);
         let (result2, c2) = result1.overflowing_add(c);
         let v1 = left.is_overflow_add(right);
         let v2 = result1.is_overflow_add(c);
 
-        self.r.cpsr.set_nz_by(result2);
-        self.r.cpsr.set_c(c1 | c2);
-        self.r.cpsr.set_v(v1 | v2);
+        self.cpsr.set_nz_by(result2);
+        self.cpsr.set_c(c1 | c2);
+        self.cpsr.set_v(v1 | v2);
 
         Ok(())
     }
 
-    fn thumb_sbc_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
-        let c = self.r.cpsr.c() as u16;
+    fn thumb_sbc_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
+        let c = self.cpsr.c() as u16;
 
         let (result1, c1) = left.overflowing_sub(right);
         let (result2, c2) = result1.overflowing_sub(c);
         let v1 = left.is_overflow_sub(right);
         let v2 = result1.is_overflow_sub(c);
 
-        self.r.cpsr.set_nz_by(result2);
-        self.r.cpsr.set_c(c1 | c2);
-        self.r.cpsr.set_v(v1 | v2);
+        self.cpsr.set_nz_by(result2);
+        self.cpsr.set_c(c1 | c2);
+        self.cpsr.set_v(v1 | v2);
 
         Ok(())
     }
 
-    fn thumb_ror_mov(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_ror_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left.rotate_right(right as u32);
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
-        self.r.cpsr.set_c(left & 0b00000001 == 1);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
+        self.cpsr.set_c(left & 0b00000001 == 1);
 
         Ok(())
     }
 
-    fn thumb_tst(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_tst(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left & right;
 
-        self.r.cpsr.set_nz_by(result);
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_neg(&mut self, rd: Registers, rs: Registers) -> Result<()> {
+    fn thumb_neg(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
         let left = 0 as u16;
-        let right = self.r.get(rs) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left.wrapping_sub(right);
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_ng_nzcv_by(left, right);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_ng_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_cmn(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_cmn(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
 
-        self.r.cpsr.set_pl_nzcv_by(left, right);
+        self.cpsr.set_pl_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_orr(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_orr(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left | right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_mul(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_mul(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left * right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_bic(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let left = self.r.get(rd) as u16;
-        let right = self.r.get(rs) as u16;
+    fn thumb_bic(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let left = self.get_r(rd) as u16;
+        let right = self.get_r(rs) as u16;
         let result = left & !right;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_mvn(&mut self, rd: Registers, rs: Registers) -> Result<()> {
-        let val = self.r.get(rs) as u16;
+    fn thumb_mvn(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
+        let val = self.get_r(rs) as u16;
         let result = !val;
 
-        self.r.set(rd, result as u32);
-        self.r.cpsr.set_nz_by(result);
+        self.set_r(rd, result as u32)?;
+        self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_push(&mut self, registers: Vec<Registers>) -> Result<()> {
-        let mut addr = self.r.get(Registers::SP);
+    fn thumb_push(&mut self, registers: Vec<RegisterType>) -> Result<()> {
+        let mut addr = self.get_r(RegisterType::SP);
 
         for r in registers {
-            let val = self.r.get(r);
+            let val = self.get_r(r);
 
             addr = addr.wrapping_sub(4);
 
             self.bus.write_32(addr, val)?;
         }
 
-        self.r.set(Registers::SP, addr);
+        self.set_r(RegisterType::SP, addr)?;
 
         Ok(())
     }
 
-    fn thumb_pop(&mut self, registers: Vec<Registers>) -> Result<()> {
-        self.thumb_ldmia(Registers::SP, registers)
+    fn thumb_pop(&mut self, registers: Vec<RegisterType>) -> Result<()> {
+        self.thumb_ldmia(RegisterType::SP, registers)
     }
 
-    fn thumb_stmia(&mut self, rb: Registers, registers: Vec<Registers>) -> Result<()> {
-        let mut addr = self.r.get(rb);
+    fn thumb_stmia(&mut self, rb: RegisterType, registers: Vec<RegisterType>) -> Result<()> {
+        let mut addr = self.get_r(rb);
 
         for r in registers {
-            let val = self.r.get(r);
+            let val = self.get_r(r);
 
             self.bus.write_32(addr, val)?;
 
             addr = addr.wrapping_add(4);
         }
 
-        self.r.set(rb, addr);
+        self.set_r(rb, addr)?;
 
         Ok(())
     }
 
-    fn thumb_ldmia(&mut self, rb: Registers, registers: Vec<Registers>) -> Result<()> {
-        let mut addr = self.r.get(rb);
+    fn thumb_ldmia(&mut self, rb: RegisterType, registers: Vec<RegisterType>) -> Result<()> {
+        let mut addr = self.get_r(rb);
 
         for r in registers {
             let val = self.bus.read_32(addr)?;
 
-            self.r.set(r, val);
+            self.set_r(r, val)?;
 
             addr = addr.wrapping_add(4);
         }
 
-        self.r.set(rb, addr);
+        self.set_r(rb, addr)?;
 
         Ok(())
     }
 
     fn thumb_branch(&mut self, offset: i16) -> Result<()> {
-        let base_addr = self.r.pc;
+        let base_addr = self.pc;
         let offset = (offset as i32) << 1;
         let addr = (base_addr as i32).wrapping_add(offset) as u32;
 
-        self.r.pc = addr;
+        self.pc = addr;
+
+        self.refresh_prefetch()?;
 
         Ok(())
     }
 
     fn thumb_long_branch_first(&mut self, offset: i16) -> Result<()> {
-        let base_addr = self.r.pc;
+        let base_addr = self.pc;
         let offset = (offset as i32) << 12;
         let addr = (base_addr as i32).wrapping_add(offset) as u32;
 
-        self.r.set(Registers::LR, addr);
+        self.set_r(RegisterType::LR, addr)?;
 
         Ok(())
     }
 
     fn thumb_long_branch_second(&mut self, offset: i16) -> Result<()> {
-        let base_addr = self.r.get(Registers::LR);
+        let base_addr = self.get_r(RegisterType::LR);
         let offset = (offset as i32) << 1;
         let addr = (base_addr as i32).wrapping_add(offset) as u32;
 
-        self.r.pc = addr;
-        self.r.cpsr.set_t(addr & 1 == 1);
+        self.pc = addr;
+        self.cpsr.set_t(addr & 1 == 1);
+
+        self.refresh_prefetch()?;
 
         Ok(())
     }

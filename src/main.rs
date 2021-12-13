@@ -1,5 +1,4 @@
 use env_logger::{Builder, Target};
-use log::debug;
 use pixels::{Pixels, SurfaceTexture};
 use rgba::{gba::Gba, rom::Rom};
 use std::{
@@ -23,10 +22,12 @@ enum UiThreadEvent {
 }
 
 fn main() {
-    let mut builder = Builder::from_default_env();
-    builder.target(Target::Stdout);
-
-    builder.init();
+    Builder::from_default_env()
+        .format_timestamp(None)
+        .format_level(false)
+        .format_module_path(false)
+        .target(Target::Stdout)
+        .init();
 
     let event_loop = EventLoop::new();
     let mut input = WinitInputHelper::new();

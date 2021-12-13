@@ -45,9 +45,15 @@ impl Rom {
 
     pub fn read_8(&self, addr: u32) -> Result<u8> {
         match addr {
-            0x0800_0000..=0x09FF_FFFF => Ok(self.data[(addr - 0x0800_0000) as usize]),
-            0x0A00_0000..=0x0BFF_FFFF => Ok(self.data[(addr - 0x0A00_0000) as usize]),
-            0x0C00_0000..=0x0DFF_FFFF => Ok(self.data[(addr - 0x0C00_0000) as usize]),
+            0x0800_0000..=0x09FF_FFFF => {
+                Ok(*self.data.get((addr - 0x0800_0000) as usize).unwrap_or(&0))
+            }
+            0x0A00_0000..=0x0BFF_FFFF => {
+                Ok(*self.data.get((addr - 0x0A00_0000) as usize).unwrap_or(&0))
+            }
+            0x0C00_0000..=0x0DFF_FFFF => {
+                Ok(*self.data.get((addr - 0x0C00_0000) as usize).unwrap_or(&0))
+            }
             0x0E00_0000..=0x0E00_FFFF => Ok(self.sram[(addr - 0x0E00_0000) as usize]),
             _ => Ok(0),
         }
@@ -69,7 +75,7 @@ impl Rom {
         let actual = self.data[0x0A0..=0x0BC]
             .iter()
             .fold(0, |acc: u8, x| acc.wrapping_sub(*x))
-            - 0x19;
+            .wrapping_sub(0x19);
 
         debug!("checksum: {:#02X} = {:#02X}", actual, checksum);
 

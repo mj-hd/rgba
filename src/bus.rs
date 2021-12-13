@@ -1,10 +1,34 @@
 use anyhow::Result;
 
 use crate::{bios::BIOS, ppu::Ppu, rom::Rom};
+use bitfield::bitfield;
+
+bitfield! {
+    #[derive(Default, Clone, Copy)]
+    pub struct If(u16);
+    game_pak, _: 13;
+    keypad, _: 12;
+    dma_3, _: 11;
+    dma_2, _: 10;
+    dma_1, _: 9;
+    dma_0, _: 8;
+    serial, _: 7;
+    timer_3, _: 6;
+    timer_2, _: 5;
+    timer_1, _: 4;
+    timer_0, _: 3;
+    lcd_v_counter, _: 2;
+    lcd_h_blank, _: 1;
+    lcd_v_blank, _: 0;
+}
 
 pub struct Bus {
     wram_onboard: Box<[u8; 0x4_0000]>,
     wram_onchip: Box<[u8; 0x8000]>,
+
+    interrupt_disable: bool,
+    interrupt_enable: If,
+    interrupt_flag: If,
 
     pub ppu: Ppu,
 
@@ -16,6 +40,10 @@ impl Bus {
         Self {
             wram_onboard: Box::new([0; 0x4_0000]),
             wram_onchip: Box::new([0; 0x8000]),
+
+            interrupt_disable: false,
+            interrupt_enable: If(0),
+            interrupt_flag: If(0),
 
             ppu,
             rom,
@@ -98,6 +126,9 @@ impl Bus {
             0x0400_0050 => self.ppu.read_bld_cnt(),
             0x0400_0052 => self.ppu.read_bld_alpha(),
             0x0400_0054 => self.ppu.read_bld_y(),
+            0x0400_0200 => Ok(self.interrupt_enable.0),
+            0x0400_0202 => Ok(self.interrupt_flag.0),
+            0x0400_0208 => Ok(if self.interrupt_disable { 1 } else { 0 }),
             0x0400_0000..=0x04FF_FFFF => Ok(0),
             _ => {
                 let low = self.read_8(addr)?;
@@ -188,6 +219,21 @@ impl Bus {
             0x0400_0050 => self.ppu.write_bld_cnt(val),
             0x0400_0052 => self.ppu.write_bld_alpha(val),
             0x0400_0054 => self.ppu.write_bld_y(val),
+            0x0400_0200 => {
+                self.interrupt_enable.0 = val;
+
+                Ok(())
+            }
+            0x0400_0202 => {
+                self.interrupt_flag.0 = val;
+
+                Ok(())
+            }
+            0x0400_0208 => {
+                self.interrupt_disable = val > 0;
+
+                Ok(())
+            }
             0x0400_0000..=0x04FF_FFFF => Ok(()),
             _ => {
                 self.write_8(addr, val as u8)?;
