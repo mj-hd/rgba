@@ -65,6 +65,15 @@ enum Mode {
     System,
 }
 
+impl Mode {
+    fn has_spsr(&self) -> bool {
+        match self {
+            Mode::User | Mode::System => false,
+            _ => true,
+        }
+    }
+}
+
 impl From<u32> for Mode {
     #[bitmatch]
     fn from(n: u32) -> Mode {
@@ -330,6 +339,37 @@ struct Exception {
     fiq: bool,
 }
 
+#[derive(Default)]
+struct Op2 {
+    val: u32,
+    c: Option<bool>,
+    by_register: bool,
+}
+
+impl Op2 {
+    fn new(val: u32, c: bool) -> Self {
+        Self {
+            val,
+            c: Some(c),
+            ..Self::default()
+        }
+    }
+
+    fn by_register(self, f: bool) -> Self {
+        Self {
+            by_register: f,
+            ..self
+        }
+    }
+
+    fn c_not_affected(self, f: bool) -> Self {
+        Self {
+            c: if f { None } else { self.c },
+            ..self
+        }
+    }
+}
+
 pub struct Cpu {
     common_r: [CommonRegister; 8],
     fiq_r: [FiqRegister; 5],
@@ -368,8 +408,8 @@ impl Cpu {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        // self.pc = 0x0000_0000;
-        self.pc = 0x0800_0000;
+        self.pc = 0x0000_0000;
+        // self.pc = 0x0800_0000;
         self.cpsr.0 = 0x0000_001F;
         self.reset_sp();
 
@@ -411,21 +451,21 @@ impl Cpu {
             let opecode = opecode as u16;
 
             trace!(
-                "{} cpsr: {:08X} {:04X} prefetch: {:08X}",
+                "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
                 register_status,
                 self.cpsr.0,
                 opecode,
-                self.prefetch[0],
+                self.pc,
             );
 
             self.do_mnemonic_thumb(opecode)?;
         } else {
             trace!(
-                "{} cpsr: {:08X} {:04X} prefetch: {:08X}",
+                "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
                 register_status,
                 self.cpsr.0,
                 opecode,
-                self.prefetch[0],
+                self.pc,
             );
 
             self.do_mnemonic(opecode)?;
@@ -627,119 +667,109 @@ impl Cpu {
     }
 
     #[bitmatch]
-    fn op2_im(&self, p: u32) -> (u32, Option<bool>) {
-        (p, None)
+    fn op2_im(&self, p: u32) -> Op2 {
+        Op2::new(p, self.cpsr.c())
     }
 
     #[bitmatch]
-    fn op2_im_shift(&self, p: u32) -> (u32, Option<bool>) {
+    fn op2_im_shift(&self, p: u32) -> Op2 {
         #[bitmatch]
         let "ssss_nnnnnnnn" = p;
 
         if s == 0 {
-            (n, None)
+            Op2::new(n, self.cpsr.c())
         } else {
             let val = n.rotate_right(s * 2);
-            (val, Some(val & (1 << 31) > 0))
+            Op2::new(val, val & (1 << 31) > 0)
         }
     }
 
     #[bitmatch]
-    fn op2_reg(&self, p: u32) -> (u32, Option<bool>) {
+    fn op2_reg(&self, p: u32) -> Op2 {
         #[bitmatch]
         let "ssss_sttfrrrr" = p;
 
-        let val = self.get_r(RegisterType::from(r));
+        let by_register = f == 1;
 
-        let c_not_affected = f == 1 && (s >> 1) == 0;
+        let r = RegisterType::from(r);
+        let val = self.get_r(r)
+            + if by_register && r == RegisterType::PC {
+                4
+            } else {
+                0
+            };
 
-        let shift = if f == 1 {
-            let r = s >> 1;
-            self.get_r(RegisterType::from(r)) as u8 as u32
+        let c_not_affected = by_register && (s >> 1) == 0;
+
+        let shift = if by_register {
+            let r = RegisterType::from(s >> 1);
+            self.get_r(r) as u8 as u32
         } else {
             s
         };
 
-        let zero_shift = f == 0 && shift == 0;
+        let zero_shift = !by_register && shift == 0;
 
         match t {
             // LSL
-            0b00 => {
-                let result = if zero_shift {
-                    (val, None)
-                } else if shift == 0 {
-                    (val, None)
-                } else if shift < 32 {
-                    (
-                        val.checked_shl(shift).unwrap_or(0),
-                        Some(val.checked_shr(32 - shift).unwrap_or(0) & 1 > 0),
-                    )
-                } else if shift == 32 {
-                    (0, Some(val & 1 > 0))
-                } else {
-                    (0, Some(false))
-                };
-
-                (result.0, if c_not_affected { None } else { result.1 })
+            0b00 => if shift == 0 {
+                Op2::new(val, self.cpsr.c())
+            } else if shift < 32 {
+                Op2::new(
+                    val.checked_shl(shift).unwrap_or(0),
+                    val.checked_shr(32 - shift).unwrap_or(0) & 1 > 0,
+                )
+            } else if shift == 32 {
+                Op2::new(0, val & 1 > 0)
+            } else {
+                Op2::new(0, false)
             }
+            .by_register(by_register)
+            .c_not_affected(c_not_affected),
             // LSR
-            0b01 => {
-                let result = if zero_shift {
-                    (0, val >> 31 > 0)
-                } else {
-                    (
-                        val.checked_shr(shift).unwrap_or(0),
-                        val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 > 0,
-                    )
-                };
-                (result.0, if c_not_affected { None } else { Some(result.1) })
+            0b01 => if zero_shift {
+                Op2::new(0, val >> 31 > 0)
+            } else {
+                Op2::new(
+                    val.checked_shr(shift).unwrap_or(0),
+                    val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 > 0,
+                )
             }
+            .by_register(by_register)
+            .c_not_affected(c_not_affected),
             // ASR
-            0b10 => {
-                let result = if zero_shift || shift >= 32 {
-                    let c = val >> 31 > 0;
-                    (if c { !0 } else { 0 }, c)
-                } else {
-                    (
-                        (val as i32).checked_shr(shift).unwrap_or(0) as u32,
-                        (val as i32)
-                            .checked_shr(shift.saturating_sub(1))
-                            .unwrap_or(0)
-                            & 1
-                            > 0,
-                    )
-                };
-
-                (result.0, if c_not_affected { None } else { Some(result.1) })
+            0b10 => if zero_shift || shift >= 32 {
+                let c = val >> 31 > 0;
+                Op2::new(if c { !0 } else { 0 }, c)
+            } else {
+                Op2::new(
+                    (val as i32).checked_shr(shift).unwrap_or(0) as u32,
+                    (val as i32)
+                        .checked_shr(shift.saturating_sub(1))
+                        .unwrap_or(0)
+                        & 1
+                        > 0,
+                )
             }
+            .by_register(by_register)
+            .c_not_affected(c_not_affected),
             // ROR
-            0b11 => {
-                if zero_shift {
-                    let c = if self.cpsr.c() { 1 } else { 0 };
-                    (
-                        (c << 31) | (val >> 1),
-                        if c_not_affected {
-                            None
-                        } else {
-                            Some(val & 1 == 1)
-                        },
-                    )
-                } else {
-                    (
-                        val.rotate_right(shift),
-                        if c_not_affected {
-                            None
-                        } else {
-                            Some(val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 == 1)
-                        },
-                    )
-                }
+            0b11 => if zero_shift {
+                let c = if self.cpsr.c() { 1 } else { 0 };
+                Op2::new((c << 31) | (val >> 1), val & 1 == 1)
+            } else {
+                Op2::new(
+                    val.rotate_right(shift),
+                    val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 == 1,
+                )
             }
+            .by_register(by_register)
+            .c_not_affected(c_not_affected),
             _ => panic!("invalid op2 shift type"),
         }
     }
 
-    fn op2(&self, i: u32, p: u32) -> (u32, Option<bool>) {
+    fn op2(&self, i: u32, p: u32) -> Op2 {
         if i == 1 {
             self.op2_im_shift(p)
         } else {
@@ -747,7 +777,7 @@ impl Cpu {
         }
     }
 
-    fn op2_simple(&self, i: u32, p: u32) -> (u32, Option<bool>) {
+    fn op2_simple(&self, i: u32, p: u32) -> Op2 {
         if i == 1 {
             self.op2_reg(p)
         } else {
@@ -1024,7 +1054,7 @@ impl Cpu {
                 )
             }
 
-            _ => Ok(()),
+            _ => self.und(),
         }
     }
 
@@ -1172,7 +1202,7 @@ impl Cpu {
             }
 
             // Load/Store sign-extended byte halfword
-            "01010oo_rrrbbbddd" => {
+            "01010oor_rrbbbddd" => {
                 let ro = RegisterType::from(r);
                 let rb = RegisterType::from(b);
                 let rd = RegisterType::from(d);
@@ -1457,7 +1487,7 @@ impl Cpu {
             // BKPT
             "10111110_????????" => self.bkpt(),
 
-            _ => bail!("invalid thumb opecode"),
+            _ => self.und(),
         }
     }
 
@@ -1496,8 +1526,8 @@ impl Cpu {
     }
 
     fn swi(&mut self) -> Result<()> {
+        self.exception.swi = true;
         self.refresh_prefetch()?;
-        debug!("SWI");
 
         Ok(())
     }
@@ -1509,7 +1539,8 @@ impl Cpu {
     }
 
     fn und(&mut self) -> Result<()> {
-        debug!("UND");
+        self.exception.undefined_instruction = true;
+        self.refresh_prefetch()?;
 
         Ok(())
     }
@@ -1520,50 +1551,56 @@ impl Cpu {
         state: bool,
         rn: RegisterType,
         rd: RegisterType,
-        op2: (u32, Option<bool>),
+        op2: Op2,
     ) -> Result<()> {
+        let operand = self.get_r(rn)
+            + if op2.by_register && rn == RegisterType::PC {
+                4
+            } else {
+                0
+            };
         let cpsr = match opcode {
             // AND
-            0b0000 => self.and(rn, rd, op2),
+            0b0000 => self.and(operand, rd, op2),
             // EOR
-            0b0001 => self.eor(rn, rd, op2),
+            0b0001 => self.eor(operand, rd, op2),
             // SUB
-            0b0010 => self.sub(rn, rd, op2),
+            0b0010 => self.sub(operand, rd, op2),
             // RSB
-            0b0011 => self.rsb(rn, rd, op2),
+            0b0011 => self.rsb(operand, rd, op2),
             // ADD
-            0b0100 => self.add(rn, rd, op2),
+            0b0100 => self.add(operand, rd, op2),
             // ADC
-            0b0101 => self.adc(rn, rd, op2),
+            0b0101 => self.adc(operand, rd, op2),
             // SBC
-            0b0110 => self.sbc(rn, rd, op2),
+            0b0110 => self.sbc(operand, rd, op2),
             // RSC
-            0b0111 => self.rsc(rn, rd, op2),
+            0b0111 => self.rsc(operand, rd, op2),
             // TST
-            0b1000 => self.tst(rn, op2),
+            0b1000 => self.tst(operand, op2, rd),
             // TEQ
-            0b1001 => self.teq(rn, op2),
+            0b1001 => self.teq(operand, op2, rd),
             // CMP
-            0b1010 => self.cmp(rn, op2),
+            0b1010 => self.cmp(operand, op2, rd),
             // CMN
-            0b1011 => self.cmn(rn, op2),
+            0b1011 => self.cmn(operand, op2, rd),
             // ORR
-            0b1100 => self.orr(rn, rd, op2),
+            0b1100 => self.orr(operand, rd, op2),
             // MOV
             0b1101 => self.mov(rd, op2),
             // BIC
-            0b1110 => self.bic(rn, rd, op2),
+            0b1110 => self.bic(operand, rd, op2),
             // MVN
             0b1111 => self.mvn(rd, op2),
             _ => bail!("invalid alu opcode"),
         }?;
 
         if state {
-            let orig_t = self.cpsr.t();
+            let prev_cpsr = self.cpsr;
 
             self.cpsr = cpsr;
 
-            if self.cpsr.t() != orig_t {
+            if self.cpsr.t() != prev_cpsr.t() {
                 self.refresh_prefetch()?;
             }
         }
@@ -1572,7 +1609,7 @@ impl Cpu {
     }
 
     fn _alu_pc_special_if_needed(&self, rd: RegisterType) -> Option<Psr> {
-        if rd == RegisterType::PC {
+        if self.cpsr.mode().has_spsr() && rd == RegisterType::PC {
             Some(self.get_spsr())
         } else {
             None
@@ -1584,7 +1621,7 @@ impl Cpu {
         left: u32,
         right: u32,
         rd: RegisterType,
-        c: Option<bool>,
+        op2: Op2,
         f: Operation,
     ) -> Result<Psr>
     where
@@ -1601,7 +1638,7 @@ impl Cpu {
         let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
-        if let Some(c) = c {
+        if let Some(c) = op2.c {
             cpsr.set_c(c);
         }
 
@@ -1660,7 +1697,8 @@ impl Cpu {
         &mut self,
         left: u32,
         right: u32,
-        c: Option<bool>,
+        op2: Op2,
+        rd: RegisterType,
         f: Operation,
     ) -> Result<Psr>
     where
@@ -1668,75 +1706,48 @@ impl Cpu {
     {
         let result = f(left, right);
 
+        if rd == RegisterType::PC {
+            self.refresh_prefetch()?;
+            self.pc = result;
+        }
+
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
+
         let mut cpsr = self.cpsr;
         cpsr.set_nz_by(result);
 
-        if let Some(c) = c {
+        if let Some(c) = op2.c {
             cpsr.set_c(c);
         }
 
         Ok(cpsr)
     }
 
-    fn and(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, c): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left & right)
+    fn and(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_logical(operand, op2.val, rd, op2, |left, right| left & right)
     }
 
-    fn eor(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, c): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left ^ right)
+    fn eor(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_logical(operand, op2.val, rd, op2, |left, right| left ^ right)
     }
 
-    fn sub(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, _): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._alu_arit_ng(self.get_r(rn), op2, rd, |left, right| {
-            left.wrapping_sub(right)
-        })
+    fn sub(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_arit_ng(operand, op2.val, rd, |left, right| left.wrapping_sub(right))
     }
 
-    fn rsb(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, _): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._alu_arit_ng(op2, self.get_r(rn), rd, |left, right| {
-            left.wrapping_sub(right)
-        })
+    fn rsb(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_arit_ng(op2.val, operand, rd, |left, right| left.wrapping_sub(right))
     }
 
-    fn add(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, _): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._alu_arit_pl(self.get_r(rn), op2, rd, |left, right| {
-            left.wrapping_add(right)
-        })
+    fn add(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_arit_pl(operand, op2.val, rd, |left, right| left.wrapping_add(right))
     }
 
-    fn adc(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, _): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        let val1 = self.get_r(rn);
-        let val2 = op2;
+    fn adc(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        let val1 = operand;
+        let val2 = op2.val;
         let val3 = self.cpsr.c() as u32;
 
         let (result1, c1) = val1.overflowing_add(val2);
@@ -1782,35 +1793,33 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn sbc(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, _): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._sbc(self.get_r(rn), op2, rd)
+    fn sbc(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._sbc(operand, op2.val, rd)
     }
 
-    fn rsc(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, _): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._sbc(op2, self.get_r(rn), rd)
+    fn rsc(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._sbc(op2.val, operand, rd)
     }
 
-    fn tst(&mut self, rn: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
-        self._alu_test(self.get_r(rn), op2, c, |left, right| left & right)
+    fn tst(&mut self, operand: u32, op2: Op2, rd: RegisterType) -> Result<Psr> {
+        self._alu_test(operand, op2.val, op2, rd, |left, right| left & right)
     }
 
-    fn teq(&mut self, rn: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
-        self._alu_test(self.get_r(rn), op2, c, |left, right| left ^ right)
+    fn teq(&mut self, operand: u32, op2: Op2, rd: RegisterType) -> Result<Psr> {
+        self._alu_test(operand, op2.val, op2, rd, |left, right| left ^ right)
     }
 
-    fn cmp(&mut self, rn: RegisterType, (op2, _): (u32, Option<bool>)) -> Result<Psr> {
-        let left = self.get_r(rn);
-        let right = op2;
+    fn cmp(&mut self, operand: u32, op2: Op2, rd: RegisterType) -> Result<Psr> {
+        let left = operand;
+        let right = op2.val;
+
+        if rd == RegisterType::PC {
+            self.refresh_prefetch()?;
+        }
+
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
 
         let mut cpsr = self.cpsr;
         cpsr.set_ng_nzcv_by(left, right);
@@ -1818,9 +1827,17 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn cmn(&mut self, rn: RegisterType, (op2, _): (u32, Option<bool>)) -> Result<Psr> {
-        let left = self.get_r(rn);
-        let right = op2;
+    fn cmn(&mut self, operand: u32, op2: Op2, rd: RegisterType) -> Result<Psr> {
+        let left = operand;
+        let right = op2.val;
+
+        if rd == RegisterType::PC {
+            self.refresh_prefetch()?;
+        }
+
+        if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
+            return Ok(cpsr);
+        }
 
         let mut cpsr = self.cpsr;
         cpsr.set_pl_nzcv_by(left, right);
@@ -1828,31 +1845,21 @@ impl Cpu {
         Ok(cpsr)
     }
 
-    fn orr(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, c): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left | right)
+    fn orr(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_logical(operand, op2.val, rd, op2, |left, right| left | right)
     }
 
-    fn mov(&mut self, rd: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
+    fn mov(&mut self, rd: RegisterType, op2: Op2) -> Result<Psr> {
         // trace!("MOV rd: {:?} = op2 {:08X}", rd, op2);
-        self._alu_logical(op2, 0, rd, c, |left, _| left)
+        self._alu_logical(op2.val, 0, rd, op2, |left, _| left)
     }
 
-    fn bic(
-        &mut self,
-        rn: RegisterType,
-        rd: RegisterType,
-        (op2, c): (u32, Option<bool>),
-    ) -> Result<Psr> {
-        self._alu_logical(self.get_r(rn), op2, rd, c, |left, right| left & !right)
+    fn bic(&mut self, operand: u32, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_logical(operand, op2.val, rd, op2, |left, right| left & !right)
     }
 
-    fn mvn(&mut self, rd: RegisterType, (op2, c): (u32, Option<bool>)) -> Result<Psr> {
-        self._alu_logical(op2, 0, rd, c, |left, _| !left)
+    fn mvn(&mut self, rd: RegisterType, op2: Op2) -> Result<Psr> {
+        self._alu_logical(op2.val, 0, rd, op2, |left, _| !left)
     }
 
     fn multiply(
@@ -2026,7 +2033,7 @@ impl Cpu {
             psr.set_v(val.v());
         }
 
-        if t && psr.mode() != Mode::User {
+        if t && self.cpsr.mode() != Mode::User {
             psr.set_i(val.i());
             psr.set_f(val.f());
             psr.set_t(val.t());
@@ -2086,9 +2093,10 @@ impl Cpu {
         load_store: u32,
         rn: RegisterType,
         rd: RegisterType,
-        (offset, _): (u32, Option<bool>),
+        op2: Op2,
     ) -> Result<()> {
         let base_addr = self.get_r(rn);
+        let offset = op2.val;
 
         let addr = if up_down == 1 {
             // up: add to base addr
@@ -2121,7 +2129,7 @@ impl Cpu {
         load_store: u32,
         rn: RegisterType,
         rd: RegisterType,
-        (offset, _): (u32, Option<bool>),
+        op2: Op2,
     ) -> Result<()> {
         let addr = self.get_r(rn);
 
@@ -2134,9 +2142,9 @@ impl Cpu {
         }
 
         let new_addr = if up_down == 1 {
-            addr.wrapping_add(offset)
+            addr.wrapping_add(op2.val)
         } else {
-            addr.wrapping_sub(offset)
+            addr.wrapping_sub(op2.val)
         };
 
         self.set_r(rn, new_addr)?;
