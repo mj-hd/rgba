@@ -86,7 +86,7 @@ impl IntoI10 for u16 {
     fn into_i10(&self) -> i16 {
         let mut result = self & 0x3FF;
 
-        if self & 0x0400 == 1 {
+        if self & 0x0400 > 1 {
             result |= 0xFC00;
         }
 
@@ -107,5 +107,67 @@ impl IntoI24 for u32 {
         }
 
         result as i32
+    }
+}
+
+pub struct ShiftResult(pub u32, pub bool);
+
+pub trait Shift {
+    fn lsl(self, shifter: u32, c: bool) -> ShiftResult;
+    fn lsr(self, shifter: u32, zero_shift: bool) -> ShiftResult;
+    fn asr(self, shifter: u32, zero_shift: bool) -> ShiftResult;
+    fn ror(self, shifter: u32, c: bool, zero_shift: bool) -> ShiftResult;
+}
+
+impl Shift for u32 {
+    fn lsl(self, shifter: u32, c: bool) -> ShiftResult {
+        if shifter == 0 {
+            ShiftResult(self, c)
+        } else {
+            ShiftResult(
+                self.checked_shl(shifter).unwrap_or(0),
+                if shifter <= 32 {
+                    self.checked_shr(32 - shifter).unwrap_or(0) & 1 > 0
+                } else {
+                    false
+                },
+            )
+        }
+    }
+
+    fn lsr(self, shifter: u32, zero_shift: bool) -> ShiftResult {
+        let shifter = if zero_shift { 32 } else { shifter };
+        ShiftResult(
+            self.checked_shr(shifter).unwrap_or(0),
+            self.checked_shr(shifter.saturating_sub(1)).unwrap_or(0) & 1 > 0,
+        )
+    }
+
+    fn asr(self, shifter: u32, zero_shift: bool) -> ShiftResult {
+        if zero_shift || shifter >= 32 {
+            let c = self >> 31 > 0;
+            return ShiftResult(if c { !0 } else { 0 }, c);
+        }
+
+        ShiftResult(
+            (self as i32).checked_shr(shifter).unwrap_or(0) as u32,
+            (self as i32)
+                .checked_shr(shifter.saturating_sub(1))
+                .unwrap_or(0)
+                & 1
+                > 0,
+        )
+    }
+
+    fn ror(self, shifter: u32, c: bool, zero_shift: bool) -> ShiftResult {
+        if zero_shift {
+            let c = c as u32;
+            ShiftResult((c << 31) | (self >> 1), self & 1 == 1)
+        } else {
+            ShiftResult(
+                self.rotate_right(shifter),
+                self.checked_shr(shifter.saturating_sub(1)).unwrap_or(0) & 1 == 1,
+            )
+        }
     }
 }

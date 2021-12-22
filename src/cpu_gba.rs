@@ -4,12 +4,13 @@ use crate::{
     arit::IntoI10,
     arit::IsOverflowAdd,
     arit::{IntoI24, IsOverflowSub},
+    arit::{Shift, ShiftResult},
     bus::Bus,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use bitfield::bitfield;
 use bitmatch::bitmatch;
-use log::{debug, trace};
+use log::{debug, error, trace};
 use num_derive::FromPrimitive;
 use num_traits::{
     ops::overflowing::{OverflowingAdd, OverflowingSub},
@@ -122,7 +123,7 @@ bitfield! {
     i, set_i: 7;
     f, set_f: 6;
     t, set_t: 5;
-    into Mode, mode, set_mode: 5, 0;
+    into Mode, mode, set_mode: 4, 0;
 }
 
 impl Psr {
@@ -346,6 +347,12 @@ struct Op2 {
     by_register: bool,
 }
 
+impl From<ShiftResult> for Op2 {
+    fn from(ShiftResult(result, c): ShiftResult) -> Op2 {
+        Op2::new(result, c)
+    }
+}
+
 impl Op2 {
     fn new(val: u32, c: bool) -> Self {
         Self {
@@ -376,6 +383,7 @@ pub struct Cpu {
     mode_r: [ModeRegister; 2],
 
     pc: u32,
+    pc_invalidated: bool,
     cpsr: Psr,
     spsr: ModeRegister<Psr>,
 
@@ -383,8 +391,10 @@ pub struct Cpu {
 
     cycles: u32,
     stalls: u32,
-    prefetch: Vec<u32>,
+    prefetch: [u32; 2],
     halt: bool,
+
+    trace: bool,
 
     pub bus: Bus,
 }
@@ -394,16 +404,18 @@ impl Cpu {
         Self {
             cycles: 0,
             stalls: 0,
-            prefetch: vec![],
+            prefetch: Default::default(),
             halt: false,
             bus,
             common_r: Default::default(),
             fiq_r: Default::default(),
             mode_r: Default::default(),
             pc: 0,
+            pc_invalidated: false,
             cpsr: Default::default(),
             spsr: Default::default(),
             exception: Default::default(),
+            trace: false,
         }
     }
 
@@ -415,7 +427,7 @@ impl Cpu {
 
         self.refresh_prefetch()?;
         let opecode = self.fetch()?;
-        self.prefetch.insert(0, opecode);
+        self.prefetch[0] = opecode;
 
         self.exception = Default::default();
 
@@ -433,40 +445,61 @@ impl Cpu {
             return Ok(());
         }
 
+        if self.check_irq() {
+            self.exception.irq = true;
+        }
+
         self.do_exception()?;
+
+        if self.pc_invalidated {
+            self.refresh_prefetch()?;
+            self.pc_invalidated = false;
+        }
 
         if self.halt {
             return Ok(());
         }
 
-        let register_status = (0u8..=15u8)
-            .map(|r| RegisterType::from(r))
-            .map(|r| format!("{:08X}", self.get_r(r)))
-            .collect::<Vec<_>>()
-            .join(" ");
+        // let mut register_status: String = "".to_string();
+
+        // if self.trace {
+        //     register_status = (0u8..=15u8)
+        //         .map(|r| RegisterType::from(r))
+        //         .map(|r| format!("{:08X}", self.get_r(r)))
+        //         .collect::<Vec<_>>()
+        //         .join(" ");
+        // }
 
         let opecode = self.pop_prefetch()?;
+
+        if self.pc >= 0x0800_0000 {
+            self.trace = true;
+        }
 
         if self.cpsr.t() {
             let opecode = opecode as u16;
 
-            trace!(
-                "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
-                register_status,
-                self.cpsr.0,
-                opecode,
-                self.pc,
-            );
+            // if self.trace {
+            //     trace!(
+            //         "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
+            //         register_status,
+            //         self.cpsr.0,
+            //         opecode,
+            //         self.pc,
+            //     );
+            // }
 
             self.do_mnemonic_thumb(opecode)?;
         } else {
-            trace!(
-                "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
-                register_status,
-                self.cpsr.0,
-                opecode,
-                self.pc,
-            );
+            // if self.trace {
+            //     trace!(
+            //         "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
+            //         register_status,
+            //         self.cpsr.0,
+            //         opecode,
+            //         self.pc,
+            //     );
+            // }
 
             self.do_mnemonic(opecode)?;
         }
@@ -474,74 +507,147 @@ impl Cpu {
         Ok(())
     }
 
+    fn check_irq(&mut self) -> bool {
+        if !self.cpsr.i() && self.bus.interrupt_disable {
+            if self.bus.interrupt_enable.lcd_v_blank() && self.bus.interrupt_flag.lcd_v_blank() {
+                self.bus.interrupt_flag.set_lcd_v_blank(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.lcd_h_blank() && self.bus.interrupt_flag.lcd_h_blank() {
+                self.bus.interrupt_flag.set_lcd_h_blank(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.timer_0() && self.bus.interrupt_flag.timer_0() {
+                self.bus.interrupt_flag.set_timer_0(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.timer_1() && self.bus.interrupt_flag.timer_1() {
+                self.bus.interrupt_flag.set_timer_1(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.timer_2() && self.bus.interrupt_flag.timer_2() {
+                self.bus.interrupt_flag.set_timer_2(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.timer_3() && self.bus.interrupt_flag.timer_3() {
+                self.bus.interrupt_flag.set_timer_3(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.serial() && self.bus.interrupt_flag.serial() {
+                self.bus.interrupt_flag.set_serial(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.dma_0() && self.bus.interrupt_flag.dma_0() {
+                self.bus.interrupt_flag.set_dma_0(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.dma_1() && self.bus.interrupt_flag.dma_1() {
+                self.bus.interrupt_flag.set_dma_1(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.dma_2() && self.bus.interrupt_flag.dma_2() {
+                self.bus.interrupt_flag.set_dma_2(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.dma_3() && self.bus.interrupt_flag.dma_3() {
+                self.bus.interrupt_flag.set_dma_3(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.keypad() && self.bus.interrupt_flag.keypad() {
+                self.bus.interrupt_flag.set_keypad(false);
+                return true;
+            }
+
+            if self.bus.interrupt_enable.game_pak() && self.bus.interrupt_flag.game_pak() {
+                self.bus.interrupt_flag.set_game_pak(false);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     fn do_exception(&mut self) -> Result<()> {
         if self.exception.reset {
-            self.cpsr.set_mode(Mode::Supervisor.into());
-            self.do_interrupt(0x0000_0000, true)?;
+            self.do_interrupt(0x0000_0000, true, Mode::Supervisor.into())?;
+            self.exception.reset = false;
         }
 
         if self.exception.data_abort {
-            self.cpsr.set_mode(Mode::Abort.into());
-            self.do_interrupt(0x0000_0010, self.cpsr.f())?;
+            self.do_interrupt(0x0000_0010, self.cpsr.f(), Mode::Abort.into())?;
+            self.exception.data_abort = false;
         }
 
         if self.exception.fiq {
-            self.cpsr.set_mode(Mode::Fiq.into());
-            self.do_interrupt(0x0000_001C, true)?;
+            self.do_interrupt(0x0000_001C, true, Mode::Fiq.into())?;
+            self.exception.fiq = false;
         }
 
         if self.exception.irq {
-            self.cpsr.set_mode(Mode::Irq.into());
-            self.do_interrupt(0x0000_0018, self.cpsr.f())?;
+            self.do_interrupt(0x0000_0018, self.cpsr.f(), Mode::Irq.into())?;
+            self.exception.irq = false;
         }
 
         if self.exception.prefetch_abort {
-            self.cpsr.set_mode(Mode::Abort.into());
-            self.do_interrupt(0x0000_000C, self.cpsr.f())?;
+            self.do_interrupt(0x0000_000C, self.cpsr.f(), Mode::Abort.into())?;
+            self.exception.prefetch_abort = false;
         }
 
         if self.exception.swi {
-            self.cpsr.set_mode(Mode::Supervisor.into());
-            self.do_interrupt(0x0000_0008, self.cpsr.f())?;
+            self.do_interrupt(0x0000_0008, self.cpsr.f(), Mode::Supervisor.into())?;
+            self.exception.swi = false;
         }
 
         if self.exception.undefined_instruction {
-            self.cpsr.set_mode(Mode::Undefined.into());
-            self.do_interrupt(0x0000_0004, self.cpsr.f())?;
+            self.do_interrupt(0x0000_0004, self.cpsr.f(), Mode::Undefined.into())?;
+            self.exception.undefined_instruction = false;
         }
 
         if self.exception.address_exceeds {
-            self.cpsr.set_mode(Mode::Supervisor.into());
-            self.do_interrupt(0x0000_0014, self.cpsr.f())?;
+            self.do_interrupt(0x0000_0014, self.cpsr.f(), Mode::Supervisor.into())?;
         }
 
         Ok(())
     }
 
-    fn do_interrupt(&mut self, addr: u32, new_f: bool) -> Result<()> {
+    fn do_interrupt(&mut self, addr: u32, new_f: bool, mode: Mode) -> Result<()> {
+        let orig_pc = self.pc;
+        let orig_cpsr = self.cpsr;
+
         self.pc = addr;
-        self.set_r(RegisterType::LR, self.pc)?;
-        self.set_spsr(self.cpsr);
+        self.pc_invalidated = true;
+        self.cpsr.set_mode(mode.into());
+
+        self.set_r(RegisterType::LR, orig_pc - self.instr_size())?;
+
+        self.set_spsr(orig_cpsr);
 
         self.cpsr.set_t(false);
         self.cpsr.set_i(true);
         self.cpsr.set_f(new_f);
 
-        self.refresh_prefetch()?;
-
         Ok(())
     }
 
     fn refresh_prefetch(&mut self) -> Result<()> {
-        self.prefetch.clear();
-
         let opecode = self.fetch()?;
-        self.prefetch.insert(0, opecode);
+        self.prefetch[0] = opecode;
 
         self.pc = self.pc.wrapping_add(self.instr_size());
 
         let opecode = self.fetch()?;
-        self.prefetch.insert(0, opecode);
+        self.prefetch[1] = opecode;
 
         Ok(())
     }
@@ -549,10 +655,14 @@ impl Cpu {
     fn pop_prefetch(&mut self) -> Result<u32> {
         self.pc = self.pc.wrapping_add(self.instr_size());
 
-        let opecode = self.fetch()?;
-        self.prefetch.insert(0, opecode);
+        let next = self.prefetch[0];
 
-        self.prefetch.pop().context("prefetch exhausted")
+        self.prefetch[0] = self.prefetch[1];
+
+        let opecode = self.fetch()?;
+        self.prefetch[1] = opecode;
+
+        Ok(next)
     }
 
     fn fetch(&mut self) -> Result<u32> {
@@ -641,8 +751,8 @@ impl Cpu {
             RegisterType::SP => self.mode_r[0].set(mode, val),
             RegisterType::LR => self.mode_r[1].set(mode, val),
             RegisterType::PC => {
-                self.pc = val;
-                self.refresh_prefetch()?;
+                self.pc = val & !1u32;
+                self.pc_invalidated = true;
             }
         }
 
@@ -679,8 +789,7 @@ impl Cpu {
         if s == 0 {
             Op2::new(n, self.cpsr.c())
         } else {
-            let val = n.rotate_right(s * 2);
-            Op2::new(val, val & (1 << 31) > 0)
+            Op2::from(n.ror(s * 2, self.cpsr.c(), false))
         }
     }
 
@@ -712,59 +821,21 @@ impl Cpu {
 
         match t {
             // LSL
-            0b00 => if shift == 0 {
-                Op2::new(val, self.cpsr.c())
-            } else if shift < 32 {
-                Op2::new(
-                    val.checked_shl(shift).unwrap_or(0),
-                    val.checked_shr(32 - shift).unwrap_or(0) & 1 > 0,
-                )
-            } else if shift == 32 {
-                Op2::new(0, val & 1 > 0)
-            } else {
-                Op2::new(0, false)
-            }
-            .by_register(by_register)
-            .c_not_affected(c_not_affected),
+            0b00 => Op2::from(val.lsl(shift, self.cpsr.c()))
+                .by_register(by_register)
+                .c_not_affected(c_not_affected),
             // LSR
-            0b01 => if zero_shift {
-                Op2::new(0, val >> 31 > 0)
-            } else {
-                Op2::new(
-                    val.checked_shr(shift).unwrap_or(0),
-                    val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 > 0,
-                )
-            }
-            .by_register(by_register)
-            .c_not_affected(c_not_affected),
+            0b01 => Op2::from(val.lsr(shift, zero_shift))
+                .by_register(by_register)
+                .c_not_affected(c_not_affected),
             // ASR
-            0b10 => if zero_shift || shift >= 32 {
-                let c = val >> 31 > 0;
-                Op2::new(if c { !0 } else { 0 }, c)
-            } else {
-                Op2::new(
-                    (val as i32).checked_shr(shift).unwrap_or(0) as u32,
-                    (val as i32)
-                        .checked_shr(shift.saturating_sub(1))
-                        .unwrap_or(0)
-                        & 1
-                        > 0,
-                )
-            }
-            .by_register(by_register)
-            .c_not_affected(c_not_affected),
+            0b10 => Op2::from(val.asr(shift, zero_shift))
+                .by_register(by_register)
+                .c_not_affected(c_not_affected),
             // ROR
-            0b11 => if zero_shift {
-                let c = if self.cpsr.c() { 1 } else { 0 };
-                Op2::new((c << 31) | (val >> 1), val & 1 == 1)
-            } else {
-                Op2::new(
-                    val.rotate_right(shift),
-                    val.checked_shr(shift.saturating_sub(1)).unwrap_or(0) & 1 == 1,
-                )
-            }
-            .by_register(by_register)
-            .c_not_affected(c_not_affected),
+            0b11 => Op2::from(val.ror(shift, self.cpsr.c(), zero_shift))
+                .by_register(by_register)
+                .c_not_affected(c_not_affected),
             _ => panic!("invalid op2 shift type"),
         }
     }
@@ -1011,6 +1082,24 @@ impl Cpu {
                 RegisterType::from(f),
             ),
 
+            // Multiply
+            "cccc000o_ooosrrrr_ggggffff_1001hhhh" => {
+                // trace!("Multiply");
+
+                if !self.guard(c) {
+                    return Ok(());
+                }
+
+                self.multiply(
+                    o,
+                    s == 1,
+                    RegisterType::from(r),
+                    RegisterType::from(g),
+                    RegisterType::from(f),
+                    RegisterType::from(h),
+                )
+            }
+
             // ALU
             "cccc00io_ooosrrrr_ggggpppp_pppppppp" => {
                 // trace!(
@@ -1036,25 +1125,10 @@ impl Cpu {
                 )
             }
 
-            // Multiply
-            "cccc000o_ooosrrrr_ggggffff_1001hhhh" => {
-                // trace!("Multiply");
-
-                if !self.guard(c) {
-                    return Ok(());
-                }
-
-                self.multiply(
-                    o,
-                    s == 1,
-                    RegisterType::from(r),
-                    RegisterType::from(g),
-                    RegisterType::from(f),
-                    RegisterType::from(h),
-                )
+            _ => {
+                // FIXME: guard落ちた場合もここはいる
+                Ok(())
             }
-
-            _ => self.und(),
         }
     }
 
@@ -1062,6 +1136,13 @@ impl Cpu {
     fn do_mnemonic_thumb(&mut self, opecode: u16) -> Result<()> {
         #[bitmatch]
         match &opecode {
+            // software interrupt and breakpoint
+            // SWI
+            "11011111_????????" => self.swi(),
+
+            // BKPT
+            "10111110_????????" => self.bkpt(),
+
             // LSL
             "00000sss_ssrrrggg" => self.thumb_lsl(RegisterType::from(r), RegisterType::from(g), s),
 
@@ -1073,29 +1154,33 @@ impl Cpu {
 
             // ADD r
             "0001100r_rrgggfff" => {
-                let val = self.get_r(RegisterType::from(r)) as u16;
+                let val = self.get_r(RegisterType::from(r));
 
                 self.thumb_add(val, RegisterType::from(g), RegisterType::from(f))
             }
 
             // ADD imm
-            "0001110i_iigggfff" => self.thumb_add(i, RegisterType::from(g), RegisterType::from(f)),
+            "0001110i_iigggfff" => {
+                self.thumb_add(i as u32, RegisterType::from(g), RegisterType::from(f))
+            }
 
             // SUB r
             "0001101r_rrgggfff" => {
-                let val = self.get_r(RegisterType::from(r)) as u16;
+                let val = self.get_r(RegisterType::from(r));
 
                 self.thumb_sub(val, RegisterType::from(g), RegisterType::from(f))
             }
 
             // SUB imm
-            "0001111i_iigggfff" => self.thumb_sub(i, RegisterType::from(g), RegisterType::from(f)),
+            "0001111i_iigggfff" => {
+                self.thumb_sub(i as u32, RegisterType::from(g), RegisterType::from(f))
+            }
 
             // MOV
-            "00100rrr_nnnnnnnn" => self.thumb_mov(RegisterType::from(r), n),
+            "00100rrr_nnnnnnnn" => self.thumb_mov(RegisterType::from(r), n as u32, true),
 
             // CMP
-            "00101rrr_nnnnnnnn" => self.thumb_cmp(RegisterType::from(r), n),
+            "00101rrr_nnnnnnnn" => self.thumb_cmp(RegisterType::from(r), n as u32),
 
             // ADD MOV
             "00110rrr_nnnnnnnn" => self.thumb_add_mov(RegisterType::from(r), n),
@@ -1135,7 +1220,7 @@ impl Cpu {
 
             // CMP r
             "01000010_10rrrggg" => {
-                let n = self.get_r(RegisterType::from(g)) as u16;
+                let n = self.get_r(RegisterType::from(g));
 
                 self.thumb_cmp(RegisterType::from(r), n)
             }
@@ -1171,21 +1256,21 @@ impl Cpu {
                 match o {
                     // ADD
                     0b00 => {
-                        let val = self.get_r(rd) as u16;
+                        let val = self.get_r(rd);
 
                         self.thumb_add(val, rs, rd)
                     }
                     // CMP
                     0b01 => {
-                        let n = self.get_r(rs) as u16;
+                        let n = self.get_r(rs);
 
                         self.thumb_cmp(rd, n)
                     }
                     // MOV
                     0b10 => {
-                        let n = self.get_r(rs) as u16;
+                        let n = self.get_r(rs);
 
-                        self.thumb_mov(rd, n)
+                        self.thumb_mov(rd, n, false)
                     }
                     // BX
                     0b11 => self.bx(rs),
@@ -1195,7 +1280,7 @@ impl Cpu {
 
             // LDR relative
             "01001rrr_nnnnnnnn" => {
-                let addr = self.pc.wrapping_add(n as u32);
+                let addr = self.pc.wrapping_add(n as u32 * 4) & !2u32;
                 let rd = RegisterType::from(r);
 
                 self.ldr(addr, 4, rd)
@@ -1295,17 +1380,20 @@ impl Cpu {
                 let rd = RegisterType::from(d);
 
                 let base_addr = self.get_r(rb);
-                let addr = base_addr.wrapping_add(n as u32);
 
                 match o {
                     // STR
                     0b00 => {
                         let result = self.get_r(rd);
 
+                        let addr = base_addr.wrapping_add(n as u32 * 4);
+
                         self.bus.write_32(addr, result)
                     }
                     // LDR
                     0b01 => {
+                        let addr = base_addr.wrapping_add(n as u32 * 4);
+
                         let result = self.bus.read_32(addr)?;
 
                         self.set_r(rd, result)?;
@@ -1316,10 +1404,14 @@ impl Cpu {
                     0b10 => {
                         let result = self.get_r(rd) as u8;
 
+                        let addr = base_addr.wrapping_add(n as u32);
+
                         self.bus.write_8(addr, result)
                     }
                     // LDRB
                     0b11 => {
+                        let addr = base_addr.wrapping_add(n as u32);
+
                         let result = self.bus.read_8(addr)?;
 
                         self.set_r(rd, result as u32)?;
@@ -1409,9 +1501,9 @@ impl Cpu {
                 let mut result = self.get_r(RegisterType::SP);
 
                 if o == 1 {
-                    result = result.wrapping_sub(n as u32);
+                    result = result.wrapping_sub(n as u32 * 4);
                 } else {
-                    result = result.wrapping_add(n as u32);
+                    result = result.wrapping_add(n as u32 * 4);
                 };
 
                 self.set_r(RegisterType::SP, result)?;
@@ -1478,23 +1570,19 @@ impl Cpu {
 
             // Second Instruction
             // BX
-            "11111nnn_nnnnnnnn" => self.thumb_long_branch_second(n.into_i10()),
+            "11111nnn_nnnnnnnn" => self.thumb_long_branch_second(n),
 
-            // software interrupt and breakpoint
-            // SWI
-            "11011111_????????" => self.swi(),
+            _ => {
+                error!("UNDEFINED INSTRUCTION {:08X}", opecode);
 
-            // BKPT
-            "10111110_????????" => self.bkpt(),
-
-            _ => self.und(),
+                self.und()
+            }
         }
     }
 
     fn b(&mut self, nn: i32) -> Result<()> {
         self.pc = self.pc.wrapping_add((nn * 4) as u32);
-
-        self.refresh_prefetch()?;
+        self.pc_invalidated = true;
 
         Ok(())
     }
@@ -1503,8 +1591,7 @@ impl Cpu {
         self.set_r(RegisterType::LR, self.pc.wrapping_sub(4))?;
 
         self.pc = self.pc.wrapping_add((nn * 4) as u32);
-
-        self.refresh_prefetch()?;
+        self.pc_invalidated = true;
 
         Ok(())
     }
@@ -1520,14 +1607,13 @@ impl Cpu {
             self.cpsr.set_t(false);
         }
 
-        self.refresh_prefetch()?;
+        self.pc_invalidated = true;
 
         Ok(())
     }
 
     fn swi(&mut self) -> Result<()> {
         self.exception.swi = true;
-        self.refresh_prefetch()?;
 
         Ok(())
     }
@@ -1540,7 +1626,6 @@ impl Cpu {
 
     fn und(&mut self) -> Result<()> {
         self.exception.undefined_instruction = true;
-        self.refresh_prefetch()?;
 
         Ok(())
     }
@@ -1601,7 +1686,7 @@ impl Cpu {
             self.cpsr = cpsr;
 
             if self.cpsr.t() != prev_cpsr.t() {
-                self.refresh_prefetch()?;
+                self.pc_invalidated = true;
             }
         }
 
@@ -1707,8 +1792,8 @@ impl Cpu {
         let result = f(left, right);
 
         if rd == RegisterType::PC {
-            self.refresh_prefetch()?;
             self.pc = result;
+            self.pc_invalidated = true;
         }
 
         if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
@@ -1814,7 +1899,7 @@ impl Cpu {
         let right = op2.val;
 
         if rd == RegisterType::PC {
-            self.refresh_prefetch()?;
+            self.pc_invalidated = true;
         }
 
         if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
@@ -1832,7 +1917,7 @@ impl Cpu {
         let right = op2.val;
 
         if rd == RegisterType::PC {
-            self.refresh_prefetch()?;
+            self.pc_invalidated = true;
         }
 
         if let Some(cpsr) = self._alu_pc_special_if_needed(rd) {
@@ -2046,7 +2131,7 @@ impl Cpu {
             self.cpsr = psr;
 
             if self.cpsr.t() != orig_t {
-                self.refresh_prefetch()?;
+                self.pc_invalidated = true;
             }
         } else {
             self.set_spsr(psr);
@@ -2331,11 +2416,11 @@ impl Cpu {
     }
 
     fn thumb_lsl(&mut self, rs: RegisterType, rd: RegisterType, offset: u16) -> Result<()> {
-        let source = self.get_r(rs) as u16;
+        let source = self.get_r(rs);
 
-        let (result, c) = source.overflowing_shl(offset as u32);
+        let ShiftResult(result, c) = source.lsl(offset as u32, self.cpsr.c());
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
 
         self.cpsr.set_nz_by(result);
         self.cpsr.set_c(c);
@@ -2344,11 +2429,11 @@ impl Cpu {
     }
 
     fn thumb_lsr(&mut self, rs: RegisterType, rd: RegisterType, offset: u16) -> Result<()> {
-        let source = self.get_r(rs) as u16;
+        let source = self.get_r(rs);
 
-        let (result, c) = source.overflowing_shr(offset as u32);
+        let ShiftResult(result, c) = source.lsr(offset as u32, offset == 0);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
 
         self.cpsr.set_nz_by(result);
         self.cpsr.set_c(c);
@@ -2357,9 +2442,9 @@ impl Cpu {
     }
 
     fn thumb_asr(&mut self, rs: RegisterType, rd: RegisterType, offset: u16) -> Result<()> {
-        let source = self.get_r(rs) as i16;
+        let source = self.get_r(rs);
 
-        let (result, c) = source.overflowing_shr(offset as u32);
+        let ShiftResult(result, c) = source.asr(offset as u32, offset == 0);
 
         self.set_r(rd, result as u32)?;
 
@@ -2369,42 +2454,43 @@ impl Cpu {
         Ok(())
     }
 
-    fn thumb_add(&mut self, val: u16, rs: RegisterType, rd: RegisterType) -> Result<()> {
-        let left = self.get_r(rs) as u16;
+    fn thumb_add(&mut self, val: u32, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rs);
         let right = val;
         let result = left.wrapping_add(right);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_pl_nzcv_by(left, right);
-
-        trace!("THUMB ADD {:04X} + {:04X} = {:04X}", left, right, result);
 
         Ok(())
     }
 
-    fn thumb_sub(&mut self, val: u16, rs: RegisterType, rd: RegisterType) -> Result<()> {
-        let left = self.get_r(rs) as u16;
+    fn thumb_sub(&mut self, val: u32, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rs);
         let right = val;
         let result = left.wrapping_sub(right);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_ng_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_mov(&mut self, rd: RegisterType, n: u16) -> Result<()> {
-        let result = n as u16;
+    fn thumb_mov(&mut self, rd: RegisterType, n: u32, f: bool) -> Result<()> {
+        let result = if rd == RegisterType::PC { n & !1u32 } else { n };
 
-        self.set_r(rd, result as u32)?;
-        self.cpsr.set_nz_by(result);
+        self.set_r(rd, result)?;
+
+        if f {
+            self.cpsr.set_nz_by(result);
+        }
 
         Ok(())
     }
 
-    fn thumb_cmp(&mut self, rd: RegisterType, n: u16) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = n as u16;
+    fn thumb_cmp(&mut self, rd: RegisterType, n: u32) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = n as u32;
 
         self.cpsr.set_ng_nzcv_by(left, right);
 
@@ -2423,81 +2509,86 @@ impl Cpu {
     }
 
     fn thumb_sub_mov(&mut self, rd: RegisterType, n: u16) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = n as u16;
+        let left = self.get_r(rd);
+        let right = n as u32;
         let result = left.wrapping_sub(right);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_ng_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_and_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_and_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
         let result = left & right;
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_eor_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_eor_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
         let result = left ^ right;
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_lsl_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
-        let result = left << right;
+    fn thumb_lsl_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
 
-        self.set_r(rd, result as u32)?;
+        let ShiftResult(result, c) = left.lsl(right, self.cpsr.c());
+
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
+        self.cpsr.set_c(c);
 
         Ok(())
     }
 
-    fn thumb_lsr_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
-        let result = left >> right;
+    fn thumb_lsr_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
+        let ShiftResult(result, c) = left.lsr(right, false);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
+        self.cpsr.set_c(c);
 
         Ok(())
     }
 
-    fn thumb_asr_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as i16;
-        let right = self.get_r(rs) as u16;
-        let result = left >> right;
+    fn thumb_asr_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
+        let ShiftResult(result, c) = left.asr(right, false);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
+        self.cpsr.set_c(c);
 
         Ok(())
     }
 
-    fn thumb_adc_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
-        let c = self.cpsr.c() as u16;
+    fn thumb_adc_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
+        let c = self.cpsr.c() as u32;
 
         let (result1, c1) = left.overflowing_add(right);
         let (result2, c2) = result1.overflowing_add(c);
         let v1 = left.is_overflow_add(right);
         let v2 = result1.is_overflow_add(c);
 
+        self.set_r(rd, result2)?;
         self.cpsr.set_nz_by(result2);
         self.cpsr.set_c(c1 | c2);
         self.cpsr.set_v(v1 | v2);
@@ -2505,16 +2596,17 @@ impl Cpu {
         Ok(())
     }
 
-    fn thumb_sbc_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
-        let c = self.cpsr.c() as u16;
+    fn thumb_sbc_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
+        let c = self.cpsr.c() as u32;
 
         let (result1, c1) = left.overflowing_sub(right);
         let (result2, c2) = result1.overflowing_sub(c);
         let v1 = left.is_overflow_sub(right);
         let v2 = result1.is_overflow_sub(c);
 
+        self.set_r(rd, result2)?;
         self.cpsr.set_nz_by(result2);
         self.cpsr.set_c(c1 | c2);
         self.cpsr.set_v(v1 | v2);
@@ -2522,21 +2614,21 @@ impl Cpu {
         Ok(())
     }
 
-    fn thumb_ror_mov(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
-        let result = left.rotate_right(right as u32);
+    fn thumb_ror_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
+        let ShiftResult(result, c) = left.ror(right, self.cpsr.c(), false);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
-        self.cpsr.set_c(left & 0b00000001 == 1);
+        self.cpsr.set_c(c);
 
         Ok(())
     }
 
-    fn thumb_tst(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_tst(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
         let result = left & right;
 
         self.cpsr.set_nz_by(result);
@@ -2544,64 +2636,64 @@ impl Cpu {
         Ok(())
     }
 
-    fn thumb_neg(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = 0 as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_neg(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = 0u32;
+        let right = self.get_r(rs);
         let result = left.wrapping_sub(right);
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_ng_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_cmn(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_cmn(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
 
         self.cpsr.set_pl_nzcv_by(left, right);
 
         Ok(())
     }
 
-    fn thumb_orr(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_orr(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
         let result = left | right;
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_mul(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_mul(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
         let result = left * right;
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_bic(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let left = self.get_r(rd) as u16;
-        let right = self.get_r(rs) as u16;
+    fn thumb_bic(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let left = self.get_r(rd);
+        let right = self.get_r(rs);
         let result = left & !right;
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
 
         Ok(())
     }
 
-    fn thumb_mvn(&mut self, rd: RegisterType, rs: RegisterType) -> Result<()> {
-        let val = self.get_r(rs) as u16;
+    fn thumb_mvn(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
+        let val = self.get_r(rs);
         let result = !val;
 
-        self.set_r(rd, result as u32)?;
+        self.set_r(rd, result)?;
         self.cpsr.set_nz_by(result);
 
         Ok(())
@@ -2610,7 +2702,7 @@ impl Cpu {
     fn thumb_push(&mut self, registers: Vec<RegisterType>) -> Result<()> {
         let mut addr = self.get_r(RegisterType::SP);
 
-        for r in registers {
+        for r in registers.into_iter().rev() {
             let val = self.get_r(r);
 
             addr = addr.wrapping_sub(4);
@@ -2665,8 +2757,7 @@ impl Cpu {
         let addr = (base_addr as i32).wrapping_add(offset) as u32;
 
         self.pc = addr;
-
-        self.refresh_prefetch()?;
+        self.pc_invalidated = true;
 
         Ok(())
     }
@@ -2681,15 +2772,15 @@ impl Cpu {
         Ok(())
     }
 
-    fn thumb_long_branch_second(&mut self, offset: i16) -> Result<()> {
+    fn thumb_long_branch_second(&mut self, offset: u16) -> Result<()> {
+        let orig_pc = self.pc;
         let base_addr = self.get_r(RegisterType::LR);
-        let offset = (offset as i32) << 1;
-        let addr = (base_addr as i32).wrapping_add(offset) as u32;
+        let offset = (offset as u32) << 1;
+        let addr = base_addr.wrapping_add(offset);
 
         self.pc = addr;
-        self.cpsr.set_t(addr & 1 == 1);
-
-        self.refresh_prefetch()?;
+        self.pc_invalidated = true;
+        self.set_r(RegisterType::LR, orig_pc - 1)?;
 
         Ok(())
     }

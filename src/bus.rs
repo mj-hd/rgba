@@ -6,40 +6,48 @@ use bitfield::bitfield;
 bitfield! {
     #[derive(Default, Clone, Copy)]
     pub struct If(u16);
-    game_pak, _: 13;
-    keypad, _: 12;
-    dma_3, _: 11;
-    dma_2, _: 10;
-    dma_1, _: 9;
-    dma_0, _: 8;
-    serial, _: 7;
-    timer_3, _: 6;
-    timer_2, _: 5;
-    timer_1, _: 4;
-    timer_0, _: 3;
-    lcd_v_counter, _: 2;
-    lcd_h_blank, _: 1;
-    lcd_v_blank, _: 0;
+    pub game_pak, set_game_pak: 13;
+    pub keypad, set_keypad: 12;
+    pub dma_3, set_dma_3: 11;
+    pub dma_2, set_dma_2: 10;
+    pub dma_1, set_dma_1: 9;
+    pub dma_0, set_dma_0: 8;
+    pub serial, set_serial: 7;
+    pub timer_3, set_timer_3: 6;
+    pub timer_2, set_timer_2: 5;
+    pub timer_1, set_timer_1: 4;
+    pub timer_0, set_timer_0: 3;
+    pub lcd_v_counter, set_lcd_v_counter: 2;
+    pub lcd_h_blank, set_lcd_h_blank: 1;
+    pub lcd_v_blank, set_lcd_v_blank: 0;
 }
 
 pub struct Bus {
     wram_onboard: Box<[u8; 0x4_0000]>,
     wram_onchip: Box<[u8; 0x8000]>,
 
-    interrupt_disable: bool,
-    interrupt_enable: If,
-    interrupt_flag: If,
+    prev_h_blank: bool,
+    prev_v_blank: bool,
+    prev_v_counter: bool,
+
+    pub interrupt_disable: bool,
+    pub interrupt_enable: If,
+    pub interrupt_flag: If,
 
     pub ppu: Ppu,
 
-    pub rom: Rom,
+    pub rom: Box<Rom>,
 }
 
 impl Bus {
-    pub fn new(rom: Rom, ppu: Ppu) -> Self {
+    pub fn new(rom: Box<Rom>, ppu: Ppu) -> Self {
         Self {
             wram_onboard: Box::new([0; 0x4_0000]),
             wram_onchip: Box::new([0; 0x8000]),
+
+            prev_h_blank: false,
+            prev_v_blank: false,
+            prev_v_counter: false,
 
             interrupt_disable: false,
             interrupt_enable: If(0),
@@ -52,6 +60,32 @@ impl Bus {
 
     pub fn tick(&mut self) -> Result<()> {
         self.ppu.tick()?;
+
+        if self.ppu.dispstat.h_blank_irq_enable()
+            && self.ppu.dispstat.h_blank()
+            && self.prev_h_blank != self.ppu.dispstat.h_blank()
+        {
+            self.interrupt_flag.set_lcd_h_blank(true);
+        }
+
+        if self.ppu.dispstat.v_blank_irq_enable()
+            && self.ppu.dispstat.v_blank()
+            && self.prev_v_blank != self.ppu.dispstat.v_blank()
+        {
+            self.interrupt_flag.set_lcd_v_blank(true);
+        }
+
+        if self.ppu.dispstat.v_counter_irq_enable()
+            && self.ppu.dispstat.v_counter()
+            && self.prev_v_counter != self.ppu.dispstat.v_counter()
+        {
+            self.interrupt_flag.set_lcd_v_counter(true);
+        }
+
+        self.prev_h_blank = self.interrupt_flag.lcd_h_blank();
+        self.prev_v_blank = self.interrupt_flag.lcd_v_blank();
+        self.prev_v_counter = self.interrupt_flag.lcd_v_counter();
+
         // TODO
         Ok(())
     }
@@ -76,7 +110,7 @@ impl Bus {
                     Ok(self.high(self.read_16(addr - 1)?))
                 }
             }
-            0x0500_0000..=0x07FF_FFFF => self.ppu.read_vram_8(addr),
+            0x0500_0000..=0x07FF_FFFF => self.ppu.vram.borrow().read_vram_8(addr),
             0x0800_0000..=0x0FFF_FFFF => self.rom.read_8(addr),
             _ => Ok(0),
         }
@@ -140,12 +174,10 @@ impl Bus {
     }
 
     pub fn read_32(&self, addr: u32) -> Result<u32> {
-        let lowest = self.read_8(addr)?;
-        let lower = self.read_8(addr + 1)?;
-        let higher = self.read_8(addr + 2)?;
-        let highest = self.read_8(addr + 3)?;
+        let low = self.read_16(addr)?;
+        let high = self.read_16(addr + 2)?;
 
-        Ok((highest as u32) << 24 | (higher as u32) << 16 | (lower as u32) << 8 | lowest as u32)
+        Ok((high as u32) << 16 | low as u32)
     }
 
     pub fn write_8(&mut self, addr: u32, val: u8) -> Result<()> {
@@ -169,7 +201,7 @@ impl Bus {
                     self.write_16(addr, data & 0x00FF | ((val as u16) << 8))
                 }
             }
-            0x0500_0000..=0x07FF_FFFF => self.ppu.write_vram_8(addr, val),
+            0x0500_0000..=0x07FF_FFFF => self.ppu.vram.borrow_mut().write_vram_8(addr, val),
             0x0800_0000..=0x0FFF_FFFF => self.rom.write_8(addr, val),
             _ => Ok(()),
         }
@@ -245,10 +277,8 @@ impl Bus {
     }
 
     pub fn write_32(&mut self, addr: u32, val: u32) -> Result<()> {
-        self.write_8(addr, val as u8)?;
-        self.write_8(addr + 1, (val >> 8) as u8)?;
-        self.write_8(addr + 2, (val >> 16) as u8)?;
-        self.write_8(addr + 3, (val >> 24) as u8)?;
+        self.write_16(addr, val as u16)?;
+        self.write_16(addr + 2, (val >> 16) as u16)?;
 
         Ok(())
     }

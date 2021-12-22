@@ -7,7 +7,7 @@ pub struct Gba {
 }
 
 impl Gba {
-    pub fn new(rom: Rom) -> Self {
+    pub fn new(rom: Box<Rom>) -> Self {
         let ppu = Ppu::new();
         let bus = Bus::new(rom, ppu);
         let cpu = Cpu::new(bus);
