@@ -46,15 +46,17 @@ impl Rom {
     pub fn read_8(&self, addr: u32) -> Result<u8> {
         match addr {
             0x0800_0000..=0x09FF_FFFF => {
-                Ok(*self.data.get((addr - 0x0800_0000) as usize).unwrap_or(&0))
+                Ok(unsafe { *self.data.get_unchecked((addr - 0x0800_0000) as usize) })
             }
             0x0A00_0000..=0x0BFF_FFFF => {
-                Ok(*self.data.get((addr - 0x0A00_0000) as usize).unwrap_or(&0))
+                Ok(unsafe { *self.data.get_unchecked((addr - 0x0A00_0000) as usize) })
             }
             0x0C00_0000..=0x0DFF_FFFF => {
-                Ok(*self.data.get((addr - 0x0C00_0000) as usize).unwrap_or(&0))
+                Ok(unsafe { *self.data.get_unchecked((addr - 0x0C00_0000) as usize) })
             }
-            0x0E00_0000..=0x0E00_FFFF => Ok(self.sram[(addr - 0x0E00_0000) as usize]),
+            0x0E00_0000..=0x0E00_FFFF => {
+                Ok(unsafe { *self.sram.get_unchecked((addr - 0x0E00_0000) as usize) })
+            }
             _ => Ok(0),
         }
     }

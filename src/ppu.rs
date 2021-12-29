@@ -259,15 +259,29 @@ pub struct Vram {
 }
 
 impl Vram {
+    #[inline]
     pub fn read_vram_8(&self, addr: u32) -> Result<u8> {
         match addr {
-            0x0500_0000..=0x0500_3FFF => Ok(self.palette[(addr - 0x0500_0000) as usize]),
-            0x0600_0000..=0x0601_7FFF => Ok(self.vram[(addr - 0x0600_0000) as usize]),
-            0x0700_0000..=0x0700_3FFF => Ok(self.sprite[(addr - 0x0700_0000) as usize]),
+            0x0500_0000..=0x0500_03FF => {
+                Ok(unsafe { *self.palette.get_unchecked((addr - 0x0500_0000) as usize) })
+            }
+            0x0500_0400..=0x0500_07FF => {
+                Ok(unsafe { *self.palette.get_unchecked((addr - 0x0500_0400) as usize) })
+            }
+            0x0600_0000..=0x0601_7FFF => {
+                Ok(unsafe { *self.vram.get_unchecked((addr - 0x0600_0000) as usize) })
+            }
+            0x0602_0000..=0x0602_7FFF => {
+                Ok(unsafe { *self.vram.get_unchecked((addr - 0x0602_0000) as usize) })
+            }
+            0x0700_0000..=0x0700_3FFF => {
+                Ok(unsafe { *self.sprite.get_unchecked((addr - 0x0700_0000) as usize) })
+            }
             _ => Ok(0),
         }
     }
 
+    #[inline]
     pub fn read_vram_16(&self, addr: u32) -> Result<u16> {
         let low = self.read_vram_8(addr)?;
         let high = self.read_vram_8(addr + 1)?;
@@ -282,15 +296,28 @@ impl Vram {
         Ok((high as u32) << 16 | low as u32)
     }
 
+    #[inline]
     pub fn write_vram_8(&mut self, addr: u32, val: u8) -> Result<()> {
         match addr {
-            0x0500_0000..=0x0500_3FFF => {
+            0x0500_0000..=0x0500_03FF => {
                 self.palette[(addr - 0x0500_0000) as usize] = val;
+
+                Ok(())
+            }
+            0x0500_0400..=0x0500_07FF => {
+                self.palette[(addr - 0x0500_0400) as usize] = val;
 
                 Ok(())
             }
             0x0600_0000..=0x0601_7FFF => {
                 self.vram[(addr - 0x0600_0000) as usize] = val;
+
+                trace!("WRITE VRAM: ({:08X})={:02X}", addr, val);
+
+                Ok(())
+            }
+            0x0602_0000..=0x0602_7FFF => {
+                self.vram[(addr - 0x0602_0000) as usize] = val;
 
                 trace!("WRITE VRAM: ({:08X})={:02X}", addr, val);
 

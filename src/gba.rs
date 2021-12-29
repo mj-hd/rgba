@@ -14,8 +14,12 @@ impl Gba {
         Gba { cpu }
     }
 
-    pub fn reset(&mut self) -> Result<()> {
-        self.cpu.reset()?;
+    pub fn reset(&mut self, skip_bios: bool) -> Result<()> {
+        if skip_bios {
+            self.cpu.reset_skip_bios()?;
+        } else {
+            self.cpu.reset()?;
+        }
 
         Ok(())
     }

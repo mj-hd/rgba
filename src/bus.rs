@@ -82,27 +82,53 @@ impl Bus {
             self.interrupt_flag.set_lcd_v_counter(true);
         }
 
-        self.prev_h_blank = self.interrupt_flag.lcd_h_blank();
-        self.prev_v_blank = self.interrupt_flag.lcd_v_blank();
-        self.prev_v_counter = self.interrupt_flag.lcd_v_counter();
+        self.prev_h_blank = self.ppu.dispstat.h_blank();
+        self.prev_v_blank = self.ppu.dispstat.v_blank();
+        self.prev_v_counter = self.ppu.dispstat.v_counter();
 
         // TODO
         Ok(())
     }
 
+    #[inline]
     fn high(&self, val: u16) -> u8 {
         (val >> 8) as u8
     }
 
+    #[inline]
     fn low(&self, val: u16) -> u8 {
         val as u8
     }
 
+    #[inline]
     pub fn read_8(&self, addr: u32) -> Result<u8> {
         match addr {
-            0x0000_0000..=0x0003_FFFF => Ok(BIOS[addr as usize]),
-            0x0200_0000..=0x0203_FFFF => Ok(self.wram_onboard[(addr - 0x0200_0000) as usize]),
-            0x0300_0000..=0x0300_7FFF => Ok(self.wram_onchip[(addr - 0x0300_0000) as usize]),
+            0x0000_0000..=0x0003_FFFF => Ok(unsafe { *BIOS.get_unchecked(addr as usize) }),
+            0x0200_0000..=0x0203_FFFF => Ok(unsafe {
+                *self
+                    .wram_onboard
+                    .get_unchecked((addr - 0x0200_0000) as usize)
+            }),
+            0x0204_0000..=0x0207_FFFF => Ok(unsafe {
+                *self
+                    .wram_onboard
+                    .get_unchecked((addr - 0x0204_0000) as usize)
+            }),
+            0x0300_0000..=0x0300_7FFF => Ok(unsafe {
+                *self
+                    .wram_onchip
+                    .get_unchecked((addr - 0x0300_0000) as usize)
+            }),
+            0x0300_8000..=0x0300_FFFF => Ok(unsafe {
+                *self
+                    .wram_onchip
+                    .get_unchecked((addr - 0x0300_8000) as usize)
+            }),
+            0x03FF_FF00..=0x03FF_FFFF => Ok(unsafe {
+                *self
+                    .wram_onchip
+                    .get_unchecked((0x7F00 + addr - 0x03FF_FF00) as usize)
+            }),
             0x0400_0000..=0x04FF_FFFF => {
                 if addr % 2 == 0 {
                     Ok(self.low(self.read_16(addr)?))
@@ -116,6 +142,7 @@ impl Bus {
         }
     }
 
+    #[inline]
     pub fn read_16(&self, addr: u32) -> Result<u16> {
         match addr {
             0x0400_0000 => self.ppu.read_dispcnt(),
@@ -180,6 +207,7 @@ impl Bus {
         Ok((high as u32) << 16 | low as u32)
     }
 
+    #[inline]
     pub fn write_8(&mut self, addr: u32, val: u8) -> Result<()> {
         match addr {
             0x0200_0000..=0x0203_FFFF => {
@@ -187,8 +215,23 @@ impl Bus {
 
                 Ok(())
             }
+            0x0204_0000..=0x0207_FFFF => {
+                self.wram_onboard[(addr - 0x0204_0000) as usize] = val;
+
+                Ok(())
+            }
             0x0300_0000..=0x0300_7FFF => {
                 self.wram_onchip[(addr - 0x0300_0000) as usize] = val;
+
+                Ok(())
+            }
+            0x0300_8000..=0x0300_FFFF => {
+                self.wram_onchip[(addr - 0x0300_8000) as usize] = val;
+
+                Ok(())
+            }
+            0x03FF_FF00..=0x03FF_FFFF => {
+                self.wram_onchip[(0x7F00 + addr - 0x03FF_FF00) as usize] = val;
 
                 Ok(())
             }
@@ -207,6 +250,7 @@ impl Bus {
         }
     }
 
+    #[inline]
     pub fn write_16(&mut self, addr: u32, val: u16) -> Result<()> {
         // TODO readonly
         match addr {
@@ -257,7 +301,7 @@ impl Bus {
                 Ok(())
             }
             0x0400_0202 => {
-                self.interrupt_flag.0 = val;
+                self.interrupt_flag.0 &= !val;
 
                 Ok(())
             }

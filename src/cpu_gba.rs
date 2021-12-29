@@ -421,13 +421,22 @@ impl Cpu {
 
     pub fn reset(&mut self) -> Result<()> {
         self.pc = 0x0000_0000;
-        // self.pc = 0x0800_0000;
         self.cpsr.0 = 0x0000_001F;
         self.reset_sp();
 
         self.refresh_prefetch()?;
-        let opecode = self.fetch()?;
-        self.prefetch[0] = opecode;
+
+        self.exception = Default::default();
+
+        Ok(())
+    }
+
+    pub fn reset_skip_bios(&mut self) -> Result<()> {
+        self.pc = 0x0800_0000;
+        self.cpsr.0 = 0x0000_001F;
+        self.reset_sp_skip_bios();
+
+        self.refresh_prefetch()?;
 
         self.exception = Default::default();
 
@@ -460,46 +469,44 @@ impl Cpu {
             return Ok(());
         }
 
-        // let mut register_status: String = "".to_string();
+        self.trace = true;
 
-        // if self.trace {
-        //     register_status = (0u8..=15u8)
-        //         .map(|r| RegisterType::from(r))
-        //         .map(|r| format!("{:08X}", self.get_r(r)))
-        //         .collect::<Vec<_>>()
-        //         .join(" ");
-        // }
+        let mut register_status: String = "".to_string();
+
+        if self.trace {
+            register_status = (0u8..=15u8)
+                .map(|r| RegisterType::from(r))
+                .map(|r| format!("{:08X}", self.get_r(r)))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
 
         let opecode = self.pop_prefetch()?;
-
-        if self.pc >= 0x0800_0000 {
-            self.trace = true;
-        }
 
         if self.cpsr.t() {
             let opecode = opecode as u16;
 
-            // if self.trace {
-            //     trace!(
-            //         "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
-            //         register_status,
-            //         self.cpsr.0,
-            //         opecode,
-            //         self.pc,
-            //     );
-            // }
+            if self.trace {
+                trace!(
+                    "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
+                    register_status,
+                    self.cpsr.0,
+                    opecode,
+                    self.pc,
+                );
+            }
 
             self.do_mnemonic_thumb(opecode)?;
         } else {
-            // if self.trace {
-            //     trace!(
-            //         "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
-            //         register_status,
-            //         self.cpsr.0,
-            //         opecode,
-            //         self.pc,
-            //     );
-            // }
+            if self.trace {
+                trace!(
+                    "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
+                    register_status,
+                    self.cpsr.0,
+                    opecode,
+                    self.pc,
+                );
+            }
 
             self.do_mnemonic(opecode)?;
         }
@@ -769,11 +776,20 @@ impl Cpu {
 
     fn reset_sp(&mut self) {
         self.mode_r[0].set(Mode::User, 0x0300_7F00);
-        self.mode_r[0].set(Mode::Fiq, 0x00000000);
-        self.mode_r[0].set(Mode::Supervisor, 0x03007FE0);
-        self.mode_r[0].set(Mode::Abort, 0x00000000);
-        self.mode_r[0].set(Mode::Irq, 0x03007FA0);
-        self.mode_r[0].set(Mode::Undefined, 0x00000000);
+        self.mode_r[0].set(Mode::Fiq, 0x0000_0000);
+        self.mode_r[0].set(Mode::Supervisor, 0x0300_7FE0);
+        self.mode_r[0].set(Mode::Abort, 0x0000_0000);
+        self.mode_r[0].set(Mode::Irq, 0x0300_7FA0);
+        self.mode_r[0].set(Mode::Undefined, 0x0000_0000);
+    }
+
+    fn reset_sp_skip_bios(&mut self) {
+        self.mode_r[0].set(Mode::User, 0x0300_7F00);
+        self.mode_r[0].set(Mode::Fiq, 0x0300_7F00);
+        self.mode_r[0].set(Mode::Supervisor, 0x0300_7FE0);
+        self.mode_r[0].set(Mode::Abort, 0x0300_7F00);
+        self.mode_r[0].set(Mode::Irq, 0x0300_7FA0);
+        self.mode_r[0].set(Mode::Undefined, 0x0300_7F00);
     }
 
     #[bitmatch]
@@ -1220,9 +1236,9 @@ impl Cpu {
 
             // CMP r
             "01000010_10rrrggg" => {
-                let n = self.get_r(RegisterType::from(g));
+                let n = self.get_r(RegisterType::from(r));
 
-                self.thumb_cmp(RegisterType::from(r), n)
+                self.thumb_cmp(RegisterType::from(g), n)
             }
 
             // CMN

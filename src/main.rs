@@ -55,13 +55,13 @@ fn main() {
         thread::spawn(move || {
             let mut gba = Gba::new(rom);
 
-            gba.reset().unwrap();
+            gba.reset(true).unwrap();
 
             loop {
                 let time = Instant::now();
 
                 // for _ in 0..16777216 {
-                for _ in 0..65536 {
+                for _ in 0..(16777216 / 128) {
                     gba.tick().unwrap();
                 }
 
