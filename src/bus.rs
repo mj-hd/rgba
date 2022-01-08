@@ -1,6 +1,13 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 
-use crate::{bios::BIOS, ppu::Ppu, rom::Rom};
+use crate::{
+    bios::BIOS,
+    dma::{Dmas, DmasResult},
+    keypad::KeyPad,
+    ppu::ppu::Ppu,
+    rom::Rom,
+    timer::Timers,
+};
 use bitfield::bitfield;
 
 bitfield! {
@@ -26,16 +33,24 @@ pub struct Bus {
     wram_onboard: Box<[u8; 0x4_0000]>,
     wram_onchip: Box<[u8; 0x8000]>,
 
+    // TODO: リファクタしたい
     prev_h_blank: bool,
     prev_v_blank: bool,
     prev_v_counter: bool,
+    prev_timer_0: bool,
+    prev_timer_1: bool,
+    prev_timer_2: bool,
+    prev_timer_3: bool,
+    prev_keypad: bool,
 
-    pub interrupt_disable: bool,
+    pub ime: bool,
     pub interrupt_enable: If,
     pub interrupt_flag: If,
 
     pub ppu: Ppu,
-
+    pub timers: Timers,
+    pub dmas: Dmas,
+    pub keypad: KeyPad,
     pub rom: Box<Rom>,
 }
 
@@ -48,18 +63,56 @@ impl Bus {
             prev_h_blank: false,
             prev_v_blank: false,
             prev_v_counter: false,
+            prev_timer_0: false,
+            prev_timer_1: false,
+            prev_timer_2: false,
+            prev_timer_3: false,
+            prev_keypad: false,
 
-            interrupt_disable: false,
+            ime: false,
             interrupt_enable: If(0),
             interrupt_flag: If(0),
 
             ppu,
+            timers: Timers::new(),
+            dmas: Dmas::new(),
+            keypad: KeyPad::new(),
             rom,
         }
     }
 
     pub fn tick(&mut self) -> Result<()> {
+        self.timers.tick()?;
+        self.keypad.tick()?;
         self.ppu.tick()?;
+
+        let transfer = self.dmas.tick(
+            self.ppu.dispstat.v_blank(),
+            self.ppu.dispstat.h_blank(),
+            false,
+            false,
+        )?;
+
+        match transfer {
+            DmasResult::Transfer(size, src_addr, dst_addr) => match size {
+                2 => self.write_16(dst_addr, self.read_16(src_addr)?)?,
+                4 => self.write_32(dst_addr, self.read_32(src_addr)?)?,
+                _ => bail!("unexpected transfer size"),
+            },
+            DmasResult::Irq(0) => {
+                self.interrupt_flag.set_dma_0(true);
+            }
+            DmasResult::Irq(1) => {
+                self.interrupt_flag.set_dma_1(true);
+            }
+            DmasResult::Irq(2) => {
+                self.interrupt_flag.set_dma_2(true);
+            }
+            DmasResult::Irq(3) => {
+                self.interrupt_flag.set_dma_3(true);
+            }
+            _ => (),
+        }
 
         if self.ppu.dispstat.h_blank_irq_enable()
             && self.ppu.dispstat.h_blank()
@@ -82,9 +135,33 @@ impl Bus {
             self.interrupt_flag.set_lcd_v_counter(true);
         }
 
+        if self.timers.irq(0) && !self.prev_timer_0 {
+            self.interrupt_flag.set_timer_0(true);
+        }
+
+        if self.timers.irq(1) && !self.prev_timer_1 {
+            self.interrupt_flag.set_timer_1(true);
+        }
+
+        if self.timers.irq(2) && !self.prev_timer_2 {
+            self.interrupt_flag.set_timer_2(true);
+        }
+
+        if self.timers.irq(3) && !self.prev_timer_3 {
+            self.interrupt_flag.set_timer_3(true);
+        }
+
+        if self.keypad.irq && !self.prev_keypad {
+            self.interrupt_flag.set_keypad(true);
+        }
+
         self.prev_h_blank = self.ppu.dispstat.h_blank();
         self.prev_v_blank = self.ppu.dispstat.v_blank();
         self.prev_v_counter = self.ppu.dispstat.v_counter();
+        self.prev_timer_0 = self.timers.irq(0);
+        self.prev_timer_1 = self.timers.irq(1);
+        self.prev_timer_2 = self.timers.irq(2);
+        self.prev_timer_3 = self.timers.irq(3);
 
         // TODO
         Ok(())
@@ -136,7 +213,7 @@ impl Bus {
                     Ok(self.high(self.read_16(addr - 1)?))
                 }
             }
-            0x0500_0000..=0x07FF_FFFF => self.ppu.vram.borrow().read_vram_8(addr),
+            0x0500_0000..=0x07FF_FFFF => self.ppu.vram.read_vram_8(addr),
             0x0800_0000..=0x0FFF_FFFF => self.rom.read_8(addr),
             _ => Ok(0),
         }
@@ -144,6 +221,8 @@ impl Bus {
 
     #[inline]
     pub fn read_16(&self, addr: u32) -> Result<u16> {
+        let addr = addr & 0xFFFF_FFFE;
+
         match addr {
             0x0400_0000 => self.ppu.read_dispcnt(),
             0x0400_0002 => self.ppu.read_green_swap(),
@@ -187,9 +266,15 @@ impl Bus {
             0x0400_0050 => self.ppu.read_bld_cnt(),
             0x0400_0052 => self.ppu.read_bld_alpha(),
             0x0400_0054 => self.ppu.read_bld_y(),
+            // HACK: デフォルト200hらしく、サウンドレジスタ未実装なので一旦
+            0x0400_0088 => Ok(0x0000_0200),
+            0x0400_00B0..=0x0400_00DF => self.dmas.read_16(addr),
+            0x0400_0100..=0x0400_010F => self.timers.read_16(addr),
+            0x0400_0130 => self.keypad.read_input(),
+            0x0400_0132 => self.keypad.read_cnt(),
             0x0400_0200 => Ok(self.interrupt_enable.0),
             0x0400_0202 => Ok(self.interrupt_flag.0),
-            0x0400_0208 => Ok(if self.interrupt_disable { 1 } else { 0 }),
+            0x0400_0208 => Ok(if self.ime { 1 } else { 0 }),
             0x0400_0000..=0x04FF_FFFF => Ok(0),
             _ => {
                 let low = self.read_8(addr)?;
@@ -201,6 +286,8 @@ impl Bus {
     }
 
     pub fn read_32(&self, addr: u32) -> Result<u32> {
+        let addr = addr & 0xFFFF_FFFC;
+
         let low = self.read_16(addr)?;
         let high = self.read_16(addr + 2)?;
 
@@ -244,7 +331,7 @@ impl Bus {
                     self.write_16(addr, data & 0x00FF | ((val as u16) << 8))
                 }
             }
-            0x0500_0000..=0x07FF_FFFF => self.ppu.vram.borrow_mut().write_vram_8(addr, val),
+            0x0500_0000..=0x07FF_FFFF => self.ppu.vram.write_vram_8(addr, val),
             0x0800_0000..=0x0FFF_FFFF => self.rom.write_8(addr, val),
             _ => Ok(()),
         }
@@ -252,6 +339,8 @@ impl Bus {
 
     #[inline]
     pub fn write_16(&mut self, addr: u32, val: u16) -> Result<()> {
+        let addr = addr & 0xFFFF_FFFE;
+
         // TODO readonly
         match addr {
             0x0400_0000 => self.ppu.write_dispcnt(val),
@@ -295,6 +384,10 @@ impl Bus {
             0x0400_0050 => self.ppu.write_bld_cnt(val),
             0x0400_0052 => self.ppu.write_bld_alpha(val),
             0x0400_0054 => self.ppu.write_bld_y(val),
+            0x0400_00B0..=0x0400_00DF => self.dmas.write_16(addr, val),
+            0x0400_0100..=0x0400_010F => self.timers.write_16(addr, val),
+            0x0400_0130 => self.keypad.write_input(val),
+            0x0400_0132 => self.keypad.write_cnt(val),
             0x0400_0200 => {
                 self.interrupt_enable.0 = val;
 
@@ -306,7 +399,7 @@ impl Bus {
                 Ok(())
             }
             0x0400_0208 => {
-                self.interrupt_disable = val > 0;
+                self.ime = val > 0;
 
                 Ok(())
             }
@@ -321,6 +414,8 @@ impl Bus {
     }
 
     pub fn write_32(&mut self, addr: u32, val: u32) -> Result<()> {
+        let addr = addr & 0xFFFF_FFFC;
+
         self.write_16(addr, val as u16)?;
         self.write_16(addr + 2, (val >> 16) as u16)?;
 

@@ -1,7 +1,11 @@
 pub mod arit;
 pub mod bios;
 pub mod bus;
-pub mod cpu_gba;
+pub mod cpu;
+pub mod dma;
 pub mod gba;
+pub mod keypad;
 pub mod ppu;
 pub mod rom;
+pub mod timer;
+mod utils;

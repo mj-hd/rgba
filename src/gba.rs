@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{bus::Bus, cpu_gba::Cpu, ppu::Ppu, rom::Rom};
+use crate::{bus::Bus, cpu::cpu_gba::Cpu, keypad::KeyType, ppu::ppu::Ppu, rom::Rom};
 
 pub struct Gba {
     pub cpu: Cpu,
@@ -28,6 +28,14 @@ impl Gba {
         self.cpu.tick()?;
 
         Ok(())
+    }
+
+    pub fn key_press(&mut self, key: KeyType) {
+        self.cpu.bus.keypad.press(key);
+    }
+
+    pub fn key_release(&mut self, key: KeyType) {
+        self.cpu.bus.keypad.release(key);
     }
 
     pub fn render(&mut self) -> Result<Vec<u8>> {

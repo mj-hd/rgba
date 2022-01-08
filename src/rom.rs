@@ -36,6 +36,8 @@ impl Rom {
 
         reader.read_to_end(&mut rom.data)?;
 
+        rom.data.resize(0x0200_0000, 0);
+
         if !rom.is_valid() {
             bail!("failed to validate checksum");
         }

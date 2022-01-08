@@ -1,6 +1,6 @@
 use env_logger::{Builder, Target};
 use pixels::{Pixels, SurfaceTexture};
-use rgba::{gba::Gba, rom::Rom};
+use rgba::{gba::Gba, keypad::KeyType, rom::Rom};
 use std::{
     env,
     fs::File,
@@ -16,6 +16,11 @@ use winit::{
     window::WindowBuilder,
 };
 use winit_input_helper::WinitInputHelper;
+
+enum GbaThreadEvent {
+    KeyPressed(KeyType),
+    KeyReleased(KeyType),
+}
 
 enum UiThreadEvent {
     Render(Vec<u8>),
@@ -49,13 +54,15 @@ fn main() {
     let mut reader = BufReader::new(File::open(args[1].clone()).unwrap());
     let rom = Box::new(Rom::new(&mut reader).unwrap());
 
+    let (gba_sender, gba_receiver) = mpsc::sync_channel::<GbaThreadEvent>(1);
     let (ui_sender, ui_receiver) = mpsc::sync_channel::<UiThreadEvent>(1);
 
     {
         thread::spawn(move || {
             let mut gba = Gba::new(rom);
 
-            gba.reset(true).unwrap();
+            gba.reset(true).unwrap(); // SKIP BIOS
+                                      // gba.reset(false).unwrap();
 
             loop {
                 let time = Instant::now();
@@ -68,6 +75,16 @@ fn main() {
                 let buffer = gba.render().unwrap();
 
                 let _ = ui_sender.try_send(UiThreadEvent::Render(buffer));
+
+                match gba_receiver.try_recv() {
+                    Ok(GbaThreadEvent::KeyPressed(key)) => {
+                        gba.key_press(key);
+                    }
+                    Ok(GbaThreadEvent::KeyReleased(key)) => {
+                        gba.key_release(key);
+                    }
+                    _ => {}
+                }
 
                 let elapsed = time.elapsed().as_millis();
 
@@ -117,6 +134,28 @@ fn main() {
                     if input.key_pressed(VirtualKeyCode::Escape) || input.quit() {
                         *control_flow = ControlFlow::Exit;
                         return;
+                    }
+
+                    for (input_key, keypad_key) in [
+                        (VirtualKeyCode::Z, KeyType::A),
+                        (VirtualKeyCode::X, KeyType::B),
+                        (VirtualKeyCode::C, KeyType::Select),
+                        (VirtualKeyCode::V, KeyType::Start),
+                        (VirtualKeyCode::Up, KeyType::Up),
+                        (VirtualKeyCode::Down, KeyType::Down),
+                        (VirtualKeyCode::Left, KeyType::Left),
+                        (VirtualKeyCode::Right, KeyType::Right),
+                        (VirtualKeyCode::A, KeyType::L),
+                        (VirtualKeyCode::S, KeyType::R),
+                    ]
+                    .iter()
+                    {
+                        if input.key_pressed(*input_key) {
+                            gba_sender.send(GbaThreadEvent::KeyPressed(*keypad_key));
+                        }
+                        if input.key_released(*input_key) {
+                            gba_sender.send(GbaThreadEvent::KeyReleased(*keypad_key));
+                        }
                     }
 
                     if let Some(size) = input.window_resized() {

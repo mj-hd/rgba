@@ -112,6 +112,18 @@ impl Into<u32> for Mode {
     }
 }
 
+#[derive(Debug)]
+enum Exception {
+    Reset,
+    Undefined,
+    Swi,
+    PrefetchAbort,
+    DataAbort,
+    AddressExceeded,
+    Irq,
+    Fiq,
+}
+
 bitfield! {
     #[derive(Default, Clone, Copy)]
     pub struct Psr(u32);
@@ -328,18 +340,6 @@ impl From<u32> for Cond {
     }
 }
 
-#[derive(Default, Debug)]
-struct Exception {
-    reset: bool,
-    undefined_instruction: bool,
-    swi: bool,
-    prefetch_abort: bool,
-    data_abort: bool,
-    address_exceeds: bool,
-    irq: bool,
-    fiq: bool,
-}
-
 #[derive(Default)]
 struct Op2 {
     val: u32,
@@ -387,8 +387,6 @@ pub struct Cpu {
     cpsr: Psr,
     spsr: ModeRegister<Psr>,
 
-    exception: Exception,
-
     cycles: u32,
     stalls: u32,
     prefetch: [u32; 2],
@@ -414,7 +412,6 @@ impl Cpu {
             pc_invalidated: false,
             cpsr: Default::default(),
             spsr: Default::default(),
-            exception: Default::default(),
             trace: false,
         }
     }
@@ -426,8 +423,6 @@ impl Cpu {
 
         self.refresh_prefetch()?;
 
-        self.exception = Default::default();
-
         Ok(())
     }
 
@@ -438,31 +433,27 @@ impl Cpu {
 
         self.refresh_prefetch()?;
 
-        self.exception = Default::default();
-
         Ok(())
     }
 
     pub fn tick(&mut self) -> Result<()> {
         self.cycles = self.cycles.wrapping_add(1);
 
+        if self.pc_invalidated {
+            self.refresh_prefetch()?;
+            self.pc_invalidated = false;
+        }
+
         self.bus.tick()?;
+
+        if self.bus.dmas.active() {
+            return Ok(());
+        }
 
         if self.stalls > 0 {
             self.stalls -= 1;
 
             return Ok(());
-        }
-
-        if self.check_irq() {
-            self.exception.irq = true;
-        }
-
-        self.do_exception()?;
-
-        if self.pc_invalidated {
-            self.refresh_prefetch()?;
-            self.pc_invalidated = false;
         }
 
         if self.halt {
@@ -471,7 +462,7 @@ impl Cpu {
 
         self.trace = true;
 
-        let mut register_status: String = "".to_string();
+        let mut register_status = "".to_string();
 
         if self.trace {
             register_status = (0u8..=15u8)
@@ -483,31 +474,27 @@ impl Cpu {
 
         let opecode = self.pop_prefetch()?;
 
+        if self.check_irq() {
+            self.do_exception(Exception::Irq)?;
+
+            return Ok(());
+        }
+
+        if self.trace {
+            trace!(
+                "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
+                register_status,
+                self.cpsr.0,
+                opecode,
+                self.pc,
+            );
+        }
+
         if self.cpsr.t() {
             let opecode = opecode as u16;
 
-            if self.trace {
-                trace!(
-                    "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
-                    register_status,
-                    self.cpsr.0,
-                    opecode,
-                    self.pc,
-                );
-            }
-
             self.do_mnemonic_thumb(opecode)?;
         } else {
-            if self.trace {
-                trace!(
-                    "{} cpsr: {:08X} {:04X} prefetch_pc: {:08X}",
-                    register_status,
-                    self.cpsr.0,
-                    opecode,
-                    self.pc,
-                );
-            }
-
             self.do_mnemonic(opecode)?;
         }
 
@@ -515,69 +502,56 @@ impl Cpu {
     }
 
     fn check_irq(&mut self) -> bool {
-        if !self.cpsr.i() && self.bus.interrupt_disable {
+        if !self.cpsr.i() && self.bus.ime {
             if self.bus.interrupt_enable.lcd_v_blank() && self.bus.interrupt_flag.lcd_v_blank() {
-                self.bus.interrupt_flag.set_lcd_v_blank(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.lcd_h_blank() && self.bus.interrupt_flag.lcd_h_blank() {
-                self.bus.interrupt_flag.set_lcd_h_blank(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.timer_0() && self.bus.interrupt_flag.timer_0() {
-                self.bus.interrupt_flag.set_timer_0(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.timer_1() && self.bus.interrupt_flag.timer_1() {
-                self.bus.interrupt_flag.set_timer_1(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.timer_2() && self.bus.interrupt_flag.timer_2() {
-                self.bus.interrupt_flag.set_timer_2(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.timer_3() && self.bus.interrupt_flag.timer_3() {
-                self.bus.interrupt_flag.set_timer_3(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.serial() && self.bus.interrupt_flag.serial() {
-                self.bus.interrupt_flag.set_serial(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.dma_0() && self.bus.interrupt_flag.dma_0() {
-                self.bus.interrupt_flag.set_dma_0(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.dma_1() && self.bus.interrupt_flag.dma_1() {
-                self.bus.interrupt_flag.set_dma_1(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.dma_2() && self.bus.interrupt_flag.dma_2() {
-                self.bus.interrupt_flag.set_dma_2(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.dma_3() && self.bus.interrupt_flag.dma_3() {
-                self.bus.interrupt_flag.set_dma_3(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.keypad() && self.bus.interrupt_flag.keypad() {
-                self.bus.interrupt_flag.set_keypad(false);
                 return true;
             }
 
             if self.bus.interrupt_enable.game_pak() && self.bus.interrupt_flag.game_pak() {
-                self.bus.interrupt_flag.set_game_pak(false);
                 return true;
             }
         }
@@ -585,44 +559,39 @@ impl Cpu {
         return false;
     }
 
-    fn do_exception(&mut self) -> Result<()> {
-        if self.exception.reset {
-            self.do_interrupt(0x0000_0000, true, Mode::Supervisor.into())?;
-            self.exception.reset = false;
-        }
+    fn do_exception(&mut self, exception: Exception) -> Result<()> {
+        match exception {
+            Exception::Reset => {
+                self.do_interrupt(0x0000_0000, true, Mode::Supervisor.into())?;
+            }
 
-        if self.exception.data_abort {
-            self.do_interrupt(0x0000_0010, self.cpsr.f(), Mode::Abort.into())?;
-            self.exception.data_abort = false;
-        }
+            Exception::DataAbort => {
+                self.do_interrupt(0x0000_0010, self.cpsr.f(), Mode::Abort.into())?;
+            }
 
-        if self.exception.fiq {
-            self.do_interrupt(0x0000_001C, true, Mode::Fiq.into())?;
-            self.exception.fiq = false;
-        }
+            Exception::Fiq => {
+                self.do_interrupt(0x0000_001C, true, Mode::Fiq.into())?;
+            }
 
-        if self.exception.irq {
-            self.do_interrupt(0x0000_0018, self.cpsr.f(), Mode::Irq.into())?;
-            self.exception.irq = false;
-        }
+            Exception::Irq => {
+                self.do_interrupt(0x0000_0018, self.cpsr.f(), Mode::Irq.into())?;
+            }
 
-        if self.exception.prefetch_abort {
-            self.do_interrupt(0x0000_000C, self.cpsr.f(), Mode::Abort.into())?;
-            self.exception.prefetch_abort = false;
-        }
+            Exception::PrefetchAbort => {
+                self.do_interrupt(0x0000_000C, self.cpsr.f(), Mode::Abort.into())?;
+            }
 
-        if self.exception.swi {
-            self.do_interrupt(0x0000_0008, self.cpsr.f(), Mode::Supervisor.into())?;
-            self.exception.swi = false;
-        }
+            Exception::Swi => {
+                self.do_interrupt(0x0000_0008, self.cpsr.f(), Mode::Supervisor.into())?;
+            }
 
-        if self.exception.undefined_instruction {
-            self.do_interrupt(0x0000_0004, self.cpsr.f(), Mode::Undefined.into())?;
-            self.exception.undefined_instruction = false;
-        }
+            Exception::Undefined => {
+                self.do_interrupt(0x0000_0004, self.cpsr.f(), Mode::Undefined.into())?;
+            }
 
-        if self.exception.address_exceeds {
-            self.do_interrupt(0x0000_0014, self.cpsr.f(), Mode::Supervisor.into())?;
+            Exception::AddressExceeded => {
+                self.do_interrupt(0x0000_0014, self.cpsr.f(), Mode::Supervisor.into())?;
+            }
         }
 
         Ok(())
@@ -715,9 +684,7 @@ impl Cpu {
         }
     }
 
-    fn get_r(&self, r: RegisterType) -> u32 {
-        let mode = self.cpsr.mode();
-
+    fn get_r_by_mode(&self, r: RegisterType, mode: Mode) -> u32 {
         match r {
             RegisterType::R0 => self.common_r[0].get(mode),
             RegisterType::R1 => self.common_r[1].get(mode),
@@ -738,9 +705,11 @@ impl Cpu {
         }
     }
 
-    fn set_r(&mut self, r: RegisterType, val: u32) -> Result<()> {
-        let mode = self.cpsr.mode();
+    fn get_r(&self, r: RegisterType) -> u32 {
+        self.get_r_by_mode(r, self.cpsr.mode())
+    }
 
+    fn set_r_by_mode(&mut self, r: RegisterType, mode: Mode, val: u32) -> Result<()> {
         match r {
             RegisterType::R0 => self.common_r[0].set(mode, val),
             RegisterType::R1 => self.common_r[1].set(mode, val),
@@ -764,6 +733,10 @@ impl Cpu {
         }
 
         Ok(())
+    }
+
+    fn set_r(&mut self, r: RegisterType, val: u32) -> Result<()> {
+        self.set_r_by_mode(r, self.cpsr.mode(), val)
     }
 
     fn get_spsr(&self) -> Psr {
@@ -1049,21 +1022,23 @@ impl Cpu {
                 ),
 
             // halfword single data transfer - pre-indexing
-            "cccc0001_uiwlrrrr_ggggjjjj_1011ssss" if self.guard(c) => self
+            "cccc0001_uiwlrrrr_ggggjjjj_1ee1ssss" if self.guard(c) && e != 0 => self
                 .halfword_single_data_transfer_pre(
                     u,
                     w == 1,
                     l,
+                    e,
                     RegisterType::from(r),
                     RegisterType::from(g),
                     self.halfword_transfer_offset(i == 1, j, s),
                 ),
 
             // halfword single data transfer - post-indexing
-            "cccc0000_ui0lrrrr_ggggjjjj_1011ssss" if self.guard(c) => self
+            "cccc0000_ui0lrrrr_ggggjjjj_1ee1ssss" if self.guard(c) && e != 0 => self
                 .halfword_single_data_transfer_post(
                     u,
                     l,
+                    e,
                     RegisterType::from(r),
                     RegisterType::from(g),
                     self.halfword_transfer_offset(i == 1, j, s),
@@ -1303,7 +1278,7 @@ impl Cpu {
             }
 
             // Load/Store sign-extended byte halfword
-            "01010oor_rrbbbddd" => {
+            "0101oo1r_rrbbbddd" => {
                 let ro = RegisterType::from(r);
                 let rb = RegisterType::from(b);
                 let rd = RegisterType::from(d);
@@ -1348,7 +1323,7 @@ impl Cpu {
             }
 
             // load store with register offset
-            "0101oo0_rrrbbbddd" => {
+            "0101oo0r_rrbbbddd" => {
                 let ro = RegisterType::from(r);
                 let rb = RegisterType::from(b);
                 let rd = RegisterType::from(d);
@@ -1444,7 +1419,7 @@ impl Cpu {
                 let rd = RegisterType::from(d);
 
                 let base_addr = self.get_r(rb);
-                let addr = base_addr.wrapping_add(n as u32);
+                let addr = base_addr.wrapping_add(n as u32 * 2);
 
                 match o {
                     // STRH
@@ -1470,7 +1445,7 @@ impl Cpu {
                 let rd = RegisterType::from(r);
 
                 let base_addr = self.get_r(RegisterType::SP);
-                let addr = base_addr.wrapping_add(n as u32);
+                let addr = base_addr.wrapping_add(n as u32 * 4);
 
                 match o {
                     // STR
@@ -1623,13 +1598,15 @@ impl Cpu {
             self.cpsr.set_t(false);
         }
 
+        // trace!("BX {:?}={:08X}, T={}", r, val, self.cpsr.t());
+
         self.pc_invalidated = true;
 
         Ok(())
     }
 
     fn swi(&mut self) -> Result<()> {
-        self.exception.swi = true;
+        self.do_exception(Exception::Swi)?;
 
         Ok(())
     }
@@ -1641,7 +1618,7 @@ impl Cpu {
     }
 
     fn und(&mut self) -> Result<()> {
-        self.exception.undefined_instruction = true;
+        self.do_exception(Exception::Undefined)?;
 
         Ok(())
     }
@@ -2080,8 +2057,8 @@ impl Cpu {
         rm: RegisterType,
         rs: RegisterType,
     ) -> Result<Psr> {
-        let left = self.get_r(rm) as i64;
-        let right = self.get_r(rs) as i64;
+        let left = self.get_r(rm) as i32 as i64;
+        let right = self.get_r(rs) as i32 as i64;
 
         let result = left.wrapping_mul(right);
 
@@ -2089,7 +2066,7 @@ impl Cpu {
         self.set_r(rn, result as u32)?;
 
         let mut cpsr = self.cpsr;
-        cpsr.set_nz_by(result);
+        cpsr.set_nz_by(result as u64);
 
         Ok(cpsr)
     }
@@ -2101,8 +2078,8 @@ impl Cpu {
         rm: RegisterType,
         rs: RegisterType,
     ) -> Result<Psr> {
-        let left = self.get_r(rm) as i64;
-        let right = self.get_r(rs) as i64;
+        let left = self.get_r(rm) as i32 as i64;
+        let right = self.get_r(rs) as i32 as i64;
         let add = (((self.get_r(rd) as u64) << 32) | (self.get_r(rn) as u64)) as i64;
 
         let result = add.wrapping_add(left.wrapping_mul(right));
@@ -2157,6 +2134,10 @@ impl Cpu {
     }
 
     fn ldr(&mut self, addr: u32, size: u32, rd: RegisterType) -> Result<()> {
+        self.ldr_by_mode(addr, size, rd, self.cpsr.mode())
+    }
+
+    fn ldr_by_mode(&mut self, addr: u32, size: u32, rd: RegisterType, mode: Mode) -> Result<()> {
         let result = match size {
             1 => self.bus.read_8(addr)? as u32,
             2 => self.bus.read_16(addr)? as u32,
@@ -2164,26 +2145,36 @@ impl Cpu {
             _ => bail!("invalid byte size"),
         };
 
-        self.set_r(rd, result)?;
+        self.set_r_by_mode(rd, mode, result)?;
 
         Ok(())
     }
 
-    fn str(&mut self, addr: u32, size: u32, rd: RegisterType) -> Result<()> {
+    fn str_by_mode(&mut self, addr: u32, size: u32, rd: RegisterType, mode: Mode) -> Result<()> {
+        let mut val = self.get_r_by_mode(rd, mode);
+
+        if rd == RegisterType::PC {
+            val = val.wrapping_add(4);
+        }
+
         match size {
             1 => {
-                self.bus.write_8(addr, self.get_r(rd) as u8)?;
+                self.bus.write_8(addr, val as u8)?;
             }
             2 => {
-                self.bus.write_16(addr, self.get_r(rd) as u16)?;
+                self.bus.write_16(addr, val as u16)?;
             }
             4 => {
-                self.bus.write_32(addr, self.get_r(rd) as u32)?;
+                self.bus.write_32(addr, val as u32)?;
             }
             _ => bail!("invalid byte size"),
         }
 
         Ok(())
+    }
+
+    fn str(&mut self, addr: u32, size: u32, rd: RegisterType) -> Result<()> {
+        self.str_by_mode(addr, size, rd, self.cpsr.mode())
     }
 
     fn single_data_transfer_pre(
@@ -2210,13 +2201,17 @@ impl Cpu {
         let size = if byte_word == 1 { 1 } else { 4 };
 
         if load_store == 1 {
+            if writeback {
+                self.set_r(rn, addr)?;
+            }
+
             self.ldr(addr, size, rd)?;
         } else {
             self.str(addr, size, rd)?;
-        }
 
-        if writeback {
-            self.set_r(rn, addr)?;
+            if writeback {
+                self.set_r(rn, addr)?;
+            }
         }
 
         Ok(())
@@ -2234,21 +2229,21 @@ impl Cpu {
     ) -> Result<()> {
         let addr = self.get_r(rn);
 
-        let size = if byte_word == 1 { 1 } else { 4 };
-
-        if load_store == 1 {
-            self.ldr(addr, size, rd)?;
-        } else {
-            self.str(addr, size, rd)?;
-        }
-
         let new_addr = if up_down == 1 {
             addr.wrapping_add(op2.val)
         } else {
             addr.wrapping_sub(op2.val)
         };
 
-        self.set_r(rn, new_addr)?;
+        let size = if byte_word == 1 { 1 } else { 4 };
+
+        if load_store == 1 {
+            self.set_r(rn, new_addr)?;
+            self.ldr(addr, size, rd)?;
+        } else {
+            self.str(addr, size, rd)?;
+            self.set_r(rn, new_addr)?;
+        }
 
         Ok(())
     }
@@ -2266,6 +2261,7 @@ impl Cpu {
         up_down: u32,
         writeback: bool,
         load_store: u32,
+        extended: u32,
         rn: RegisterType,
         rd: RegisterType,
         offset: u32,
@@ -2279,13 +2275,27 @@ impl Cpu {
         };
 
         if load_store == 1 {
-            self.ldr(addr, 2, rd)?;
+            if writeback {
+                self.set_r(rn, addr)?;
+            }
+
+            let val = match extended {
+                // zero-extended halfword
+                0b01 => self.bus.read_16(addr)? as u32,
+                // sign extended byte
+                0b10 => self.bus.read_8(addr)? as i8 as i32 as u32,
+                // sign extended halfword
+                0b11 => self.bus.read_16(addr)? as i16 as i32 as u32,
+                _ => bail!("unexpected halfword extended"),
+            };
+
+            self.set_r(rd, val)?;
         } else {
             self.str(addr, 2, rd)?;
-        }
 
-        if writeback {
-            self.set_r(rn, addr)?;
+            if writeback {
+                self.set_r(rn, addr)?;
+            }
         }
 
         Ok(())
@@ -2295,17 +2305,12 @@ impl Cpu {
         &mut self,
         up_down: u32,
         load_store: u32,
+        extended: u32,
         rn: RegisterType,
         rd: RegisterType,
         offset: u32,
     ) -> Result<()> {
         let addr = self.get_r(rn);
-
-        if load_store == 1 {
-            self.ldr(addr, 2, rd)?;
-        } else {
-            self.str(addr, 2, rd)?;
-        }
 
         let new_addr = if up_down == 1 {
             addr.wrapping_add(offset)
@@ -2313,7 +2318,24 @@ impl Cpu {
             addr.wrapping_sub(offset)
         };
 
-        self.set_r(rn, new_addr)?;
+        if load_store == 1 {
+            self.set_r(rn, new_addr)?;
+
+            let val = match extended {
+                // zero-extended halfword
+                0b01 => self.bus.read_16(addr)? as u32,
+                // sign extended byte
+                0b10 => self.bus.read_8(addr)? as i8 as i32 as u32,
+                // sign extended halfword
+                0b11 => self.bus.read_16(addr)? as i16 as i32 as u32,
+                _ => bail!("unexpected halfword extended"),
+            };
+
+            self.set_r(rd, val)?;
+        } else {
+            self.str(addr, 2, rd)?;
+            self.set_r(rn, new_addr)?;
+        }
 
         Ok(())
     }
@@ -2321,7 +2343,7 @@ impl Cpu {
     fn block_data_transfer_pre(
         &mut self,
         up_down: u32,
-        _state: bool,
+        force_user: bool,
         writeback: bool,
         load_store: u32,
         rn: RegisterType,
@@ -2329,7 +2351,11 @@ impl Cpu {
     ) -> Result<()> {
         // trace!("Block Data Transfer Pre-Indexing");
 
-        let base_addr = self.get_r(rn);
+        let base_addr = if !force_user {
+            self.get_r(rn)
+        } else {
+            self.get_r_by_mode(rn, Mode::User)
+        };
         let mut offset: i32 = 0;
 
         let mut rlist = rlist.clone();
@@ -2348,14 +2374,26 @@ impl Cpu {
             let addr = ((base_addr as i32) + offset) as u32;
 
             if load_store == 1 {
-                self.ldr(addr, 4, r)?;
-            } else {
-                self.str(addr, 4, r)?;
-            };
-        }
+                if writeback {
+                    self.set_r(rn, addr)?;
+                }
 
-        if writeback {
-            self.set_r(rn, ((base_addr as i32) + offset) as u32)?;
+                if !force_user {
+                    self.ldr(addr, 4, r)?;
+                } else {
+                    self.ldr_by_mode(addr, 4, r, Mode::User)?;
+                }
+            } else {
+                if !force_user {
+                    self.str(addr, 4, r)?;
+                } else {
+                    self.str_by_mode(addr, 4, r, Mode::User)?;
+                }
+
+                if writeback {
+                    self.set_r(rn, addr)?;
+                }
+            };
         }
 
         Ok(())
@@ -2364,7 +2402,7 @@ impl Cpu {
     fn block_data_transfer_post(
         &mut self,
         up_down: u32,
-        _state: bool,
+        force_user: bool,
         writeback: bool,
         load_store: u32,
         rn: RegisterType,
@@ -2372,7 +2410,11 @@ impl Cpu {
     ) -> Result<()> {
         // trace!("Block Data Transfer Post-Indexing");
 
-        let base_addr = self.get_r(rn);
+        let base_addr = if !force_user {
+            self.get_r(rn)
+        } else {
+            self.get_r_by_mode(rn, Mode::User)
+        };
         let mut offset: i32 = 0;
 
         let mut rlist = rlist.clone();
@@ -2385,9 +2427,17 @@ impl Cpu {
             let addr = ((base_addr as i32) + offset) as u32;
 
             if load_store == 1 {
-                self.ldr(addr, 4, r)?;
+                if !force_user {
+                    self.ldr(addr, 4, r)?;
+                } else {
+                    self.ldr_by_mode(addr, 4, r, Mode::User)?;
+                }
             } else {
-                self.str(addr, 4, r)?;
+                if !force_user {
+                    self.str(addr, 4, r)?;
+                } else {
+                    self.str_by_mode(addr, 4, r, Mode::User)?;
+                }
             };
 
             offset = if up_down == 1 {
@@ -2395,10 +2445,10 @@ impl Cpu {
             } else {
                 offset.wrapping_sub(4)
             };
-        }
 
-        if writeback {
-            self.set_r(rn, ((base_addr as i32) + offset) as u32)?;
+            if writeback {
+                self.set_r(rn, ((base_addr as i32) + offset) as u32)?;
+            }
         }
 
         Ok(())
@@ -2615,7 +2665,7 @@ impl Cpu {
     fn thumb_sbc_mov(&mut self, rs: RegisterType, rd: RegisterType) -> Result<()> {
         let left = self.get_r(rd);
         let right = self.get_r(rs);
-        let c = self.cpsr.c() as u32;
+        let c = !self.cpsr.c() as u32;
 
         let (result1, c1) = left.overflowing_sub(right);
         let (result2, c2) = result1.overflowing_sub(c);
