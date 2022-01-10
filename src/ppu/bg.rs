@@ -1,7 +1,5 @@
 use anyhow::Result;
 use bitfield::bitfield;
-use image::Rgba;
-use log::trace;
 
 use super::{
     palette::{Color, Palette},
@@ -58,6 +56,10 @@ impl BgScreen {
     pub fn render_tile_screen(&mut self, vram: &mut Vram, pos: (u32, u32)) -> Result<()> {
         let (x, y) = pos;
 
+        if x % 8 != 0 {
+            return Ok(());
+        }
+
         let map_index = x / 8 + (y / 8) * 32;
         let map_base_addr = 0x0600_0000 + self.cnt.screen_base_block() as u32 * 2 * 1024;
         let map = TextBgScreen(vram.read_vram_16(map_base_addr + map_index * 2)?);
@@ -66,7 +68,7 @@ impl BgScreen {
 
         let surface = tile.rasterize(vram)?;
 
-        self.frame.draw(&surface, (pos.0, (pos.1 / 8) * 8));
+        self.frame.draw(&surface, (x, (y / 8) * 8))?;
 
         Ok(())
     }

@@ -18,27 +18,23 @@ pub struct Oam {
 }
 
 impl Oam {
-    fn from_vram(vram: &mut Vram, index: u8) -> Result<Self> {
+    fn from_vram(vram: &mut Vram, index: u8) -> Result<Option<Self>> {
         let base_addr = 0x0700_0000u32;
-        let offset = (index * 8) as u32;
-        let oam0_addr = base_addr + offset;
-        let oam1_addr = base_addr + offset + 2;
-        let oam2_addr = base_addr + offset + 4;
-        let oam3_addr = base_addr + offset + 6;
+        let offset = (index as u32) * 8;
 
+        let oam0_addr = base_addr + offset;
         let oam0 = Oam0(vram.read_vram_16(oam0_addr)?);
+
+        if oam0.disabled() {
+            return Ok(None);
+        }
+
+        let oam1_addr = base_addr + offset + 2;
         let oam1 = Oam1(vram.read_vram_16(oam1_addr)?);
+        let oam2_addr = base_addr + offset + 4;
         let oam2 = Oam2(vram.read_vram_16(oam2_addr)?);
 
-        Ok(Self { oam0, oam1, oam2 })
-    }
-
-    fn doubled(&self) -> bool {
-        self.oam0.rotation_scaling() && self.oam0.obj_disable_double_size()
-    }
-
-    fn disabled(&self) -> bool {
-        !self.oam0.rotation_scaling() && self.oam0.obj_disable_double_size()
+        Ok(Some(Self { oam0, oam1, oam2 }))
     }
 
     fn size(&self) -> (u32, u32) {
@@ -86,6 +82,10 @@ impl Oam {
                 _ => 1,
             }
     }
+
+    fn doubled(&self) -> bool {
+        self.oam0.doubled()
+    }
 }
 
 bitfield! {
@@ -107,6 +107,14 @@ impl Oam0 {
             false => PixelFormat::Bpp4,
             true => PixelFormat::Bpp8,
         }
+    }
+
+    fn doubled(&self) -> bool {
+        self.rotation_scaling() && self.obj_disable_double_size()
+    }
+
+    fn disabled(&self) -> bool {
+        !self.rotation_scaling() && self.obj_disable_double_size()
     }
 }
 
@@ -154,11 +162,10 @@ impl SpriteScreen {
 
     pub fn render_sprites(&mut self, vram: &mut Vram, dispcnt: DispCnt) -> Result<()> {
         for i in 0..128 {
-            let oam = Oam::from_vram(vram, i)?;
-
-            if oam.disabled() {
-                continue;
-            }
+            let oam = match Oam::from_vram(vram, i)? {
+                None => continue,
+                Some(oam) => oam,
+            };
 
             let doubled = oam.doubled();
             let size = oam.size();
@@ -176,7 +183,7 @@ impl SpriteScreen {
             for (offset, tile) in tiles.into_iter() {
                 let surface = tile.rasterize(vram)?;
                 self.frame
-                    .draw(&surface, (oam_pos.0 + offset.0, oam_pos.1 + offset.1));
+                    .draw(&surface, (oam_pos.0 + offset.0, oam_pos.1 + offset.1))?;
             }
         }
 

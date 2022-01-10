@@ -31,6 +31,7 @@ impl Tile {
         }
     }
 
+    #[inline]
     fn rasterize_4bpp(&self, vram: &mut Vram) -> Result<Surface> {
         let bytes_per_row = 4;
         let bytes_per_tile = bytes_per_row * 8;

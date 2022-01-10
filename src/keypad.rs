@@ -91,11 +91,11 @@ impl KeyPad {
 
         match self.cnt.irq_cond() {
             KeyCond::Or if result > 0 => {
-                trace!("KEYPAD IRQ REQUESTED");
+                //trace!("KEYPAD IRQ REQUESTED");
                 self.irq = true;
             }
             KeyCond::And if result == enable => {
-                trace!("KEYPAD IRQ REQUESTED");
+                //trace!("KEYPAD IRQ REQUESTED");
                 self.irq = true;
             }
             _ => {
@@ -107,7 +107,7 @@ impl KeyPad {
     }
 
     pub fn press(&mut self, key: KeyType) {
-        trace!("KEY PRESSED: {:?}", key);
+        //trace!("KEY PRESSED: {:?}", key);
         match key {
             KeyType::A => self.input.set_a(false),
             KeyType::B => self.input.set_b(false),
@@ -123,7 +123,7 @@ impl KeyPad {
     }
 
     pub fn release(&mut self, key: KeyType) {
-        trace!("KEY RELEASED: {:?}", key);
+        //trace!("KEY RELEASED: {:?}", key);
         match key {
             KeyType::A => self.input.set_a(true),
             KeyType::B => self.input.set_b(true),
@@ -145,7 +145,7 @@ impl KeyPad {
     pub fn write_input(&mut self, val: u16) -> Result<()> {
         self.input = KeyInput(val);
 
-        trace!("KEYPAD INPUT WROTE: {:04X}", val);
+        //trace!("KEYPAD INPUT WROTE: {:04X}", val);
 
         Ok(())
     }
@@ -157,7 +157,7 @@ impl KeyPad {
     pub fn write_cnt(&mut self, val: u16) -> Result<()> {
         self.cnt = KeyCnt(val);
 
-        trace!("KEYPAD CNT WROTE: {:04X}", val);
+        //trace!("KEYPAD CNT WROTE: {:04X}", val);
 
         Ok(())
     }

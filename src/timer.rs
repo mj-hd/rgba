@@ -120,6 +120,7 @@ impl Timers {
         Ok(())
     }
 
+    #[inline]
     pub fn read_16(&self, addr: u32) -> Result<u16> {
         match addr {
             0x0400_0100 => self.timers[0].read_value(),

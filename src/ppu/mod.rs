@@ -1,4 +1,5 @@
-use image::{ImageBuffer, Rgba};
+use anyhow::Result;
+use image::{GenericImage, GenericImageView, ImageBuffer, Rgba};
 
 type Pixel = Rgba<u8>;
 pub struct Surface(ImageBuffer<Pixel, Vec<u8>>);
@@ -9,17 +10,19 @@ impl Surface {
     }
 
     pub fn put_pixel(&mut self, x: u32, y: u32, pixel: Pixel) {
-        self.0.put_pixel(x, y, pixel);
-    }
-
-    pub fn get_pixel(&mut self, x: u32, y: u32) -> &Pixel {
-        self.0.get_pixel(x, y)
-    }
-
-    pub fn draw(&mut self, target: &Surface, pos: (u32, u32)) {
-        for (x, y, pixel) in target.0.enumerate_pixels() {
-            self.0.put_pixel(pos.0 + x, pos.1 + y, *pixel);
+        unsafe {
+            self.0.unsafe_put_pixel(x, y, pixel);
         }
+    }
+
+    pub fn get_pixel(&mut self, x: u32, y: u32) -> Pixel {
+        unsafe { self.0.unsafe_get_pixel(x, y) }
+    }
+
+    pub fn draw(&mut self, target: &Surface, pos: (u32, u32)) -> Result<()> {
+        self.0.copy_from(&target.0, pos.0, pos.1)?;
+
+        Ok(())
     }
 
     pub fn width(&self) -> u32 {

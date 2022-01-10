@@ -51,6 +51,7 @@ impl Palette {
         }
     }
 
+    #[inline]
     pub fn get_color(&self, vram: &Vram, index: u8) -> Result<Color> {
         if index == 0 {
             Ok(Color::Transparent)
@@ -60,6 +61,7 @@ impl Palette {
         }
     }
 
+    #[inline]
     pub fn get_bg_color(&self, vram: &Vram) -> Result<Color> {
         let data = ColorData(vram.read_vram_16(self.base_addr)?);
         Ok(Color::Opaque(data))

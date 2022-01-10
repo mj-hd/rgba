@@ -171,3 +171,30 @@ impl Shift for u32 {
         }
     }
 }
+
+pub trait MulOperand {
+    fn leading_blocks(self) -> u32;
+}
+
+impl MulOperand for u32 {
+    fn leading_blocks(self) -> u32 {
+        let bits = self.leading_ones().max(self.leading_zeros());
+        bits / 8
+    }
+}
+
+impl MulOperand for u64 {
+    fn leading_blocks(self) -> u32 {
+        let this = self as u32;
+        let bits = this.leading_ones().max(this.leading_zeros());
+        bits / 8
+    }
+}
+
+impl MulOperand for i64 {
+    fn leading_blocks(self) -> u32 {
+        let this = self as u32;
+        let bits = this.leading_ones().max(this.leading_zeros());
+        bits / 8
+    }
+}

@@ -37,7 +37,7 @@ fn main() {
     let event_loop = EventLoop::new();
     let mut input = WinitInputHelper::new();
 
-    let size = LogicalSize::new(512, 512);
+    let size = LogicalSize::new(240, 160);
     let window = WindowBuilder::new()
         .with_title("rgba")
         .with_inner_size(size)
@@ -47,7 +47,7 @@ fn main() {
 
     let window_size = window.inner_size();
     let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
-    let mut pixels = Pixels::new(512, 512, surface_texture).unwrap();
+    let mut pixels = Pixels::new(240, 160, surface_texture).unwrap();
 
     let args = env::args().collect::<Vec<String>>();
 
@@ -61,14 +61,14 @@ fn main() {
         thread::spawn(move || {
             let mut gba = Gba::new(rom);
 
-            gba.reset(true).unwrap(); // SKIP BIOS
-                                      // gba.reset(false).unwrap();
+            // gba.reset(true).unwrap(); // SKIP BIOS
+            gba.reset(false).unwrap();
 
             loop {
                 let time = Instant::now();
 
                 // for _ in 0..16777216 {
-                for _ in 0..(16777216 / 128) {
+                for _ in 0..(16777216 / 64) {
                     gba.tick().unwrap();
                 }
 

@@ -45,6 +45,7 @@ impl Rom {
         Ok(rom)
     }
 
+    #[inline]
     pub fn read_8(&self, addr: u32) -> Result<u8> {
         match addr {
             0x0800_0000..=0x09FF_FFFF => {
@@ -63,10 +64,13 @@ impl Rom {
         }
     }
 
+    #[inline]
     pub fn write_8(&mut self, addr: u32, val: u8) -> Result<()> {
         match addr {
             0x0E00_0000..=0x0E00_FFFF => {
-                self.sram[(addr - 0x0E00_0000) as usize] = val;
+                unsafe {
+                    *self.sram.get_unchecked_mut((addr - 0x0E00_0000) as usize) = val;
+                }
                 Ok(())
             }
             _ => Ok(()),

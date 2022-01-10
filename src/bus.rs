@@ -29,6 +29,82 @@ bitfield! {
     pub lcd_v_blank, set_lcd_v_blank: 0;
 }
 
+bitfield! {
+    #[derive(Default, Clone, Copy)]
+    pub struct WaitCnt(u16);
+    game_pak_type_flag, _: 15;
+    game_pak_prefetch_buffer, _: 14;
+    phi_terminal_output,_: 12, 11;
+    _wait_state_2_seq_access, _: 10;
+    _wait_state_2_non_seq_access, _: 9, 8;
+    _wait_state_1_seq_access, _: 7;
+    _wait_state_1_non_seq_access, _: 6, 5;
+    _wait_state_0_seq_access, _: 4;
+    _wait_state_0_non_seq_access, _: 3, 2;
+    _sram_wait_control, _: 1, 0;
+}
+
+impl WaitCnt {
+    fn sram(&self) -> u32 {
+        match self._sram_wait_control() {
+            0 => 4,
+            1 => 3,
+            2 => 2,
+            3 => 8,
+            _ => panic!("unexpected sram wait"),
+        }
+    }
+
+    fn ws_non_seq(&self, val: u16) -> u32 {
+        match val {
+            0 => 4,
+            1 => 3,
+            2 => 2,
+            3 => 8,
+            _ => panic!("unexpected ws non-seq"),
+        }
+    }
+
+    fn ws0_non_seq(&self) -> u32 {
+        self.ws_non_seq(self._wait_state_0_non_seq_access())
+    }
+
+    fn ws0_seq(&self) -> u32 {
+        match self._wait_state_0_seq_access() {
+            false => 2,
+            true => 1,
+        }
+    }
+
+    fn ws1_non_seq(&self) -> u32 {
+        self.ws_non_seq(self._wait_state_1_non_seq_access())
+    }
+
+    fn ws1_seq(&self) -> u32 {
+        match self._wait_state_1_seq_access() {
+            false => 4,
+            true => 1,
+        }
+    }
+
+    fn ws2_non_seq(&self) -> u32 {
+        self.ws_non_seq(self._wait_state_2_non_seq_access())
+    }
+
+    fn ws2_seq(&self) -> u32 {
+        match self._wait_state_2_seq_access() {
+            false => 8,
+            true => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum AccessType {
+    NonSeq,
+    Seq,
+}
+
 pub struct Bus {
     wram_onboard: Box<[u8; 0x4_0000]>,
     wram_onchip: Box<[u8; 0x8000]>,
@@ -43,9 +119,13 @@ pub struct Bus {
     prev_timer_3: bool,
     prev_keypad: bool,
 
+    pub stalls: u32,
+
     pub ime: bool,
     pub interrupt_enable: If,
     pub interrupt_flag: If,
+
+    wait_cnt: WaitCnt,
 
     pub ppu: Ppu,
     pub timers: Timers,
@@ -69,9 +149,12 @@ impl Bus {
             prev_timer_3: false,
             prev_keypad: false,
 
+            stalls: 0,
+
             ime: false,
             interrupt_enable: If(0),
             interrupt_flag: If(0),
+            wait_cnt: WaitCnt(0),
 
             ppu,
             timers: Timers::new(),
@@ -95,8 +178,8 @@ impl Bus {
 
         match transfer {
             DmasResult::Transfer(size, src_addr, dst_addr) => match size {
-                2 => self.write_16(dst_addr, self.read_16(src_addr)?)?,
-                4 => self.write_32(dst_addr, self.read_32(src_addr)?)?,
+                2 => self._write_16(dst_addr, self._read_16(src_addr)?)?,
+                4 => self._write_32(dst_addr, self._read_32(src_addr)?)?,
                 _ => bail!("unexpected transfer size"),
             },
             DmasResult::Irq(0) => {
@@ -168,6 +251,35 @@ impl Bus {
     }
 
     #[inline]
+    pub fn idle_stall(&mut self, count: u32) {
+        self.stalls += count;
+    }
+
+    #[inline]
+    fn mem_stall(&mut self, addr: u32, access: AccessType) {
+        self.stalls += match addr {
+            // ROM WS0
+            0x08000000..=0x09FFFFFF => match access {
+                AccessType::NonSeq => self.wait_cnt.ws0_non_seq(),
+                AccessType::Seq => self.wait_cnt.ws0_seq(),
+            },
+            // ROM WS1
+            0x0A000000..=0x0BFFFFFF => match access {
+                AccessType::NonSeq => self.wait_cnt.ws1_non_seq(),
+                AccessType::Seq => self.wait_cnt.ws1_seq(),
+            },
+            // ROM WS2
+            0x0C000000..=0x0DFFFFFF => match access {
+                AccessType::NonSeq => self.wait_cnt.ws2_non_seq(),
+                AccessType::Seq => self.wait_cnt.ws2_seq(),
+            },
+            // ROM SRAM
+            0x0E000000..=0x0E00FFFF => self.wait_cnt.sram(),
+            _ => 1,
+        };
+    }
+
+    #[inline]
     fn high(&self, val: u16) -> u8 {
         (val >> 8) as u8
     }
@@ -178,7 +290,7 @@ impl Bus {
     }
 
     #[inline]
-    pub fn read_8(&self, addr: u32) -> Result<u8> {
+    fn _read_8(&self, addr: u32) -> Result<u8> {
         match addr {
             0x0000_0000..=0x0003_FFFF => Ok(unsafe { *BIOS.get_unchecked(addr as usize) }),
             0x0200_0000..=0x0203_FFFF => Ok(unsafe {
@@ -208,9 +320,9 @@ impl Bus {
             }),
             0x0400_0000..=0x04FF_FFFF => {
                 if addr % 2 == 0 {
-                    Ok(self.low(self.read_16(addr)?))
+                    Ok(self.low(self._read_16(addr)?))
                 } else {
-                    Ok(self.high(self.read_16(addr - 1)?))
+                    Ok(self.high(self._read_16(addr - 1)?))
                 }
             }
             0x0500_0000..=0x07FF_FFFF => self.ppu.vram.read_vram_8(addr),
@@ -220,7 +332,13 @@ impl Bus {
     }
 
     #[inline]
-    pub fn read_16(&self, addr: u32) -> Result<u16> {
+    pub fn read_8(&mut self, addr: u32, access: AccessType) -> Result<u8> {
+        self.mem_stall(addr, access);
+        self._read_8(addr)
+    }
+
+    #[inline]
+    fn _read_16(&self, addr: u32) -> Result<u16> {
         let addr = addr & 0xFFFF_FFFE;
 
         match addr {
@@ -274,61 +392,99 @@ impl Bus {
             0x0400_0132 => self.keypad.read_cnt(),
             0x0400_0200 => Ok(self.interrupt_enable.0),
             0x0400_0202 => Ok(self.interrupt_flag.0),
+            0x0400_0204 => Ok(self.wait_cnt.0),
             0x0400_0208 => Ok(if self.ime { 1 } else { 0 }),
             0x0400_0000..=0x04FF_FFFF => Ok(0),
             _ => {
-                let low = self.read_8(addr)?;
-                let high = self.read_8(addr + 1)?;
+                let low = self._read_8(addr)?;
+                let high = self._read_8(addr + 1)?;
 
                 Ok((high as u16) << 8 | low as u16)
             }
         }
     }
 
-    pub fn read_32(&self, addr: u32) -> Result<u32> {
+    #[inline]
+    pub fn read_16(&mut self, addr: u32, access: AccessType) -> Result<u16> {
+        self.mem_stall(addr, access);
+        self._read_16(addr)
+    }
+
+    #[inline]
+    fn _read_32(&self, addr: u32) -> Result<u32> {
         let addr = addr & 0xFFFF_FFFC;
 
-        let low = self.read_16(addr)?;
-        let high = self.read_16(addr + 2)?;
+        let low = self._read_16(addr)?;
+        let high = self._read_16(addr + 2)?;
 
         Ok((high as u32) << 16 | low as u32)
     }
 
+    pub fn read_32(&mut self, addr: u32, access: AccessType) -> Result<u32> {
+        self.mem_stall(addr, access);
+
+        if 0x0800_0000 <= addr && addr <= 0x0DFF_FFFF {
+            self.mem_stall(addr, AccessType::Seq);
+        }
+
+        self._read_32(addr)
+    }
+
     #[inline]
-    pub fn write_8(&mut self, addr: u32, val: u8) -> Result<()> {
+    fn _write_8(&mut self, addr: u32, val: u8) -> Result<()> {
         match addr {
             0x0200_0000..=0x0203_FFFF => {
-                self.wram_onboard[(addr - 0x0200_0000) as usize] = val;
+                unsafe {
+                    *self
+                        .wram_onboard
+                        .get_unchecked_mut((addr - 0x0200_0000) as usize) = val;
+                }
 
                 Ok(())
             }
             0x0204_0000..=0x0207_FFFF => {
-                self.wram_onboard[(addr - 0x0204_0000) as usize] = val;
+                unsafe {
+                    *self
+                        .wram_onboard
+                        .get_unchecked_mut((addr - 0x0204_0000) as usize) = val;
+                }
 
                 Ok(())
             }
             0x0300_0000..=0x0300_7FFF => {
-                self.wram_onchip[(addr - 0x0300_0000) as usize] = val;
+                unsafe {
+                    *self
+                        .wram_onchip
+                        .get_unchecked_mut((addr - 0x0300_0000) as usize) = val;
+                }
 
                 Ok(())
             }
             0x0300_8000..=0x0300_FFFF => {
-                self.wram_onchip[(addr - 0x0300_8000) as usize] = val;
+                unsafe {
+                    *self
+                        .wram_onchip
+                        .get_unchecked_mut((addr - 0x0300_8000) as usize) = val;
+                }
 
                 Ok(())
             }
             0x03FF_FF00..=0x03FF_FFFF => {
-                self.wram_onchip[(0x7F00 + addr - 0x03FF_FF00) as usize] = val;
+                unsafe {
+                    *self
+                        .wram_onchip
+                        .get_unchecked_mut((0x7F00 + addr - 0x03FF_FF00) as usize) = val;
+                }
 
                 Ok(())
             }
             0x0400_0000..=0x04FF_FFFF => {
                 if addr % 2 == 0 {
-                    let data = self.read_16(addr)?;
-                    self.write_16(addr, data & 0xFF00 | (val as u16))
+                    let data = self._read_16(addr)?;
+                    self._write_16(addr, data & 0xFF00 | (val as u16))
                 } else {
-                    let data = self.read_16(addr)?;
-                    self.write_16(addr, data & 0x00FF | ((val as u16) << 8))
+                    let data = self._read_16(addr)?;
+                    self._write_16(addr, data & 0x00FF | ((val as u16) << 8))
                 }
             }
             0x0500_0000..=0x07FF_FFFF => self.ppu.vram.write_vram_8(addr, val),
@@ -338,7 +494,13 @@ impl Bus {
     }
 
     #[inline]
-    pub fn write_16(&mut self, addr: u32, val: u16) -> Result<()> {
+    pub fn write_8(&mut self, addr: u32, val: u8, access: AccessType) -> Result<()> {
+        self.mem_stall(addr, access);
+        self._write_8(addr, val)
+    }
+
+    #[inline]
+    fn _write_16(&mut self, addr: u32, val: u16) -> Result<()> {
         let addr = addr & 0xFFFF_FFFE;
 
         // TODO readonly
@@ -398,6 +560,11 @@ impl Bus {
 
                 Ok(())
             }
+            0x0400_0204 => {
+                self.wait_cnt.0 = val;
+
+                Ok(())
+            }
             0x0400_0208 => {
                 self.ime = val > 0;
 
@@ -405,20 +572,37 @@ impl Bus {
             }
             0x0400_0000..=0x04FF_FFFF => Ok(()),
             _ => {
-                self.write_8(addr, val as u8)?;
-                self.write_8(addr + 1, (val >> 8) as u8)?;
+                self._write_8(addr, val as u8)?;
+                self._write_8(addr + 1, (val >> 8) as u8)?;
 
                 Ok(())
             }
         }
     }
 
-    pub fn write_32(&mut self, addr: u32, val: u32) -> Result<()> {
+    #[inline]
+    pub fn write_16(&mut self, addr: u32, val: u16, access: AccessType) -> Result<()> {
+        self.mem_stall(addr, access);
+        self._write_16(addr, val)
+    }
+
+    #[inline]
+    fn _write_32(&mut self, addr: u32, val: u32) -> Result<()> {
         let addr = addr & 0xFFFF_FFFC;
 
-        self.write_16(addr, val as u16)?;
-        self.write_16(addr + 2, (val >> 16) as u16)?;
+        self._write_16(addr, val as u16)?;
+        self._write_16(addr + 2, (val >> 16) as u16)?;
 
         Ok(())
+    }
+
+    pub fn write_32(&mut self, addr: u32, val: u32, access: AccessType) -> Result<()> {
+        self.mem_stall(addr, access);
+
+        if 0x0800_0000 <= addr && addr <= 0x0DFF_FFFF {
+            self.mem_stall(addr, AccessType::Seq);
+        }
+
+        self._write_32(addr, val)
     }
 }

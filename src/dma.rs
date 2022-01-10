@@ -313,6 +313,7 @@ impl Dmas {
         }
     }
 
+    #[inline]
     pub fn read_16(&self, addr: u32) -> Result<u16> {
         match addr {
             0x0400_00BA => self.dmas[0].read_control(),

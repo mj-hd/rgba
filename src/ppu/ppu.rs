@@ -1,7 +1,6 @@
 use anyhow::Result;
 use bitfield::bitfield;
-use image::{ImageBuffer, Rgba};
-use log::{debug, trace};
+use image::{GenericImage, ImageBuffer, Rgba};
 
 use crate::utils::Shared;
 
@@ -255,37 +254,51 @@ impl Vram {
     pub fn write_vram_8(&mut self, addr: u32, val: u8) -> Result<()> {
         match addr {
             0x0500_0000..=0x0500_03FF => {
-                self.palette[(addr - 0x0500_0000) as usize] = val;
+                unsafe {
+                    *self
+                        .palette
+                        .get_unchecked_mut((addr - 0x0500_0000) as usize) = val;
+                }
 
-                debug!("WRITE PALETTE: ({:08X})={:02X}", addr, val);
+                //debug!("WRITE PALETTE: ({:08X})={:02X}", addr, val);
 
                 Ok(())
             }
             0x0500_0400..=0x0500_07FF => {
-                self.palette[(addr - 0x0500_0400) as usize] = val;
+                unsafe {
+                    *self
+                        .palette
+                        .get_unchecked_mut((addr - 0x0500_0400) as usize) = val;
+                }
 
-                debug!("WRITE PALETTE: ({:08X})={:02X}", addr, val);
+                //debug!("WRITE PALETTE: ({:08X})={:02X}", addr, val);
 
                 Ok(())
             }
             0x0600_0000..=0x0601_7FFF => {
-                self.vram[(addr - 0x0600_0000) as usize] = val;
+                unsafe {
+                    *self.vram.get_unchecked_mut((addr - 0x0600_0000) as usize) = val;
+                }
 
-                trace!("WRITE VRAM: ({:08X})={:02X}", addr, val);
+                //trace!("WRITE VRAM: ({:08X})={:02X}", addr, val);
 
                 Ok(())
             }
             0x0602_0000..=0x0602_7FFF => {
-                self.vram[(addr - 0x0602_0000) as usize] = val;
+                unsafe {
+                    *self.vram.get_unchecked_mut((addr - 0x0602_0000) as usize) = val;
+                }
 
-                trace!("WRITE VRAM: ({:08X})={:02X}", addr, val);
+                //trace!("WRITE VRAM: ({:08X})={:02X}", addr, val);
 
                 Ok(())
             }
             0x0700_0000..=0x0700_3FFF => {
-                self.sprite[(addr - 0x0700_0000) as usize] = val;
+                unsafe {
+                    *self.sprite.get_unchecked_mut((addr - 0x0700_0000) as usize) = val;
+                }
 
-                trace!("WRITE SPRITE: ({:08X})={:02X}", addr, val);
+                //trace!("WRITE SPRITE: ({:08X})={:02X}", addr, val);
 
                 Ok(())
             }
@@ -374,7 +387,7 @@ impl Ppu {
             effect_bg_screens: [Default::default(), Default::default()],
             sprite_screen: Default::default(),
             wins: [Default::default(), Default::default()],
-            current_frame: Box::new(ImageBuffer::new(512, 512)),
+            current_frame: Box::new(ImageBuffer::new(240, 160)),
             win_in: Default::default(),
             win_out: Default::default(),
             mosaic: Default::default(),
@@ -431,9 +444,7 @@ impl Ppu {
         }
 
         if self.mode == Mode::Visible {
-            if self.h_count % 8 == 0 {
-                self.render_bg()?;
-            }
+            self.render_bg()?;
             if self.h_count == 0 {
                 self.sprite_screen.clear(self.v_count as u32);
                 self.sprite_screen
@@ -531,51 +542,51 @@ impl Ppu {
 
         let bg_pixel = Palette::new_bg(0).get_bg_color(&self.vram)?.to_pixel();
 
-        for x in 0..512 {
+        for x in 0..240 {
             let mut pixel = bg_pixel;
 
             if !self.dispcnt.force_blank() {
                 if self.dispcnt.screen_display_bg0() {
                     let p = self.bg_screens[0].frame.get_pixel(
-                        (self.bg_screens[0].offset.0 as u32 + x).clamp(0, 511),
-                        (self.bg_screens[0].offset.1 as u32 + y).clamp(0, 511),
+                        (self.bg_screens[0].offset.0 as u32 + x).clamp(0, 239),
+                        (self.bg_screens[0].offset.1 as u32 + y).clamp(0, 239),
                     );
 
                     if p.0[3] != 0x00 {
-                        pixel = *p;
+                        pixel = p;
                     }
                 }
 
                 if self.dispcnt.screen_display_bg1() {
                     let p = self.bg_screens[1].frame.get_pixel(
-                        (self.bg_screens[1].offset.0 as u32 + x).clamp(0, 511),
-                        (self.bg_screens[1].offset.1 as u32 + y).clamp(0, 511),
+                        (self.bg_screens[1].offset.0 as u32 + x).clamp(0, 239),
+                        (self.bg_screens[1].offset.1 as u32 + y).clamp(0, 239),
                     );
 
                     if p.0[3] != 0x00 {
-                        pixel = *p;
+                        pixel = p;
                     }
                 }
 
                 if self.dispcnt.screen_display_bg2() {
                     let p = self.effect_bg_screens[0].bg.frame.get_pixel(
-                        (self.effect_bg_screens[0].bg.offset.0 as u32 + x).clamp(0, 511),
-                        (self.effect_bg_screens[0].bg.offset.1 as u32 + y).clamp(0, 511),
+                        (self.effect_bg_screens[0].bg.offset.0 as u32 + x).clamp(0, 239),
+                        (self.effect_bg_screens[0].bg.offset.1 as u32 + y).clamp(0, 239),
                     );
 
                     if p.0[3] != 0x00 {
-                        pixel = *p;
+                        pixel = p;
                     }
                 }
 
                 if self.dispcnt.screen_display_bg3() {
                     let p = self.effect_bg_screens[1].bg.frame.get_pixel(
-                        (self.effect_bg_screens[1].bg.offset.0 as u32 + x).clamp(0, 511),
-                        (self.effect_bg_screens[1].bg.offset.1 as u32 + y).clamp(0, 511),
+                        (self.effect_bg_screens[1].bg.offset.0 as u32 + x).clamp(0, 239),
+                        (self.effect_bg_screens[1].bg.offset.1 as u32 + y).clamp(0, 239),
                     );
 
                     if p.0[3] != 0x00 {
-                        pixel = *p;
+                        pixel = p;
                     }
                 }
             }
@@ -583,10 +594,12 @@ impl Ppu {
             let p = self.sprite_screen.frame.get_pixel(x, y);
 
             if p.0[3] != 0x00 {
-                pixel = *p;
+                pixel = p;
             }
 
-            self.current_frame.put_pixel(x, y, pixel);
+            unsafe {
+                self.current_frame.unsafe_put_pixel(x, y, pixel);
+            }
         }
 
         Ok(())
@@ -597,7 +610,7 @@ impl Ppu {
     }
     pub fn write_dispcnt(&mut self, val: u16) -> Result<()> {
         self.dispcnt = DispCnt(val);
-        trace!("WRITE DISPCNT: {}({:?})", val, self.dispcnt);
+        //trace!("WRITE DISPCNT: {}({:?})", val, self.dispcnt);
 
         Ok(())
     }
@@ -617,7 +630,7 @@ impl Ppu {
     pub fn write_dispstat(&mut self, val: u16) -> Result<()> {
         // TODO: mask readonly
         self.dispstat = DispStat(val);
-        trace!("WRITE DISPSTAT: {}({:?})", val, self.dispstat);
+        //trace!("WRITE DISPSTAT: {}({:?})", val, self.dispstat);
 
         Ok(())
     }
@@ -631,7 +644,7 @@ impl Ppu {
     }
     pub fn write_bg_0_cnt(&mut self, val: u16) -> Result<()> {
         self.bg_screens[0].cnt = BgCnt(val);
-        trace!("WRITE BG0CNT: {}({:?})", val, self.bg_screens[0].cnt);
+        //trace!("WRITE BG0CNT: {}({:?})", val, self.bg_screens[0].cnt);
 
         Ok(())
     }
@@ -641,7 +654,7 @@ impl Ppu {
     }
     pub fn write_bg_1_cnt(&mut self, val: u16) -> Result<()> {
         self.bg_screens[1].cnt = BgCnt(val);
-        trace!("WRITE BG1CNT: {}({:?})", val, self.bg_screens[1].cnt);
+        //trace!("WRITE BG1CNT: {}({:?})", val, self.bg_screens[1].cnt);
 
         Ok(())
     }
@@ -651,11 +664,11 @@ impl Ppu {
     }
     pub fn write_bg_2_cnt(&mut self, val: u16) -> Result<()> {
         self.effect_bg_screens[0].bg.cnt = BgCnt(val);
-        trace!(
-            "WRITE BG2CNT: {}({:?})",
-            val,
-            self.effect_bg_screens[0].bg.cnt
-        );
+        //trace!(
+        //    "WRITE BG2CNT: {}({:?})",
+        //    val,
+        //    self.effect_bg_screens[0].bg.cnt
+        //);
 
         Ok(())
     }
@@ -665,11 +678,11 @@ impl Ppu {
     }
     pub fn write_bg_3_cnt(&mut self, val: u16) -> Result<()> {
         self.effect_bg_screens[1].bg.cnt = BgCnt(val);
-        trace!(
-            "WRITE BG3CNT: {}({:?})",
-            val,
-            self.effect_bg_screens[1].bg.cnt
-        );
+        //trace!(
+        //    "WRITE BG3CNT: {}({:?})",
+        //    val,
+        //    self.effect_bg_screens[1].bg.cnt
+        //);
 
         Ok(())
     }
@@ -679,11 +692,11 @@ impl Ppu {
     }
     pub fn write_bg_0_offset_x(&mut self, val: u16) -> Result<()> {
         self.bg_screens[0].offset.0 = val & 0x1FF;
-        trace!(
-            "WRITE BG0 OFFSET X: {}({:?})",
-            val,
-            self.bg_screens[0].offset.0
-        );
+        //trace!(
+        //    "WRITE BG0 OFFSET X: {}({:?})",
+        //    val,
+        //    self.bg_screens[0].offset.0
+        //);
 
         Ok(())
     }
@@ -692,11 +705,11 @@ impl Ppu {
     }
     pub fn write_bg_0_offset_y(&mut self, val: u16) -> Result<()> {
         self.bg_screens[0].offset.1 = val & 0x1FF;
-        trace!(
-            "WRITE BG0 OFFSET Y: {}({:?})",
-            val,
-            self.bg_screens[0].offset.1
-        );
+        //trace!(
+        //    "WRITE BG0 OFFSET Y: {}({:?})",
+        //    val,
+        //    self.bg_screens[0].offset.1
+        //);
 
         Ok(())
     }
@@ -706,11 +719,11 @@ impl Ppu {
     }
     pub fn write_bg_1_offset_x(&mut self, val: u16) -> Result<()> {
         self.bg_screens[1].offset.0 = val & 0x1FF;
-        trace!(
-            "WRITE BG1 OFFSET X: {}({:?})",
-            val,
-            self.bg_screens[1].offset.0
-        );
+        //trace!(
+        //    "WRITE BG1 OFFSET X: {}({:?})",
+        //    val,
+        //    self.bg_screens[1].offset.0
+        //);
 
         Ok(())
     }
@@ -719,11 +732,11 @@ impl Ppu {
     }
     pub fn write_bg_1_offset_y(&mut self, val: u16) -> Result<()> {
         self.bg_screens[1].offset.1 = val & 0x1FF;
-        trace!(
-            "WRITE BG1 OFFSET Y: {}({:?})",
-            val,
-            self.bg_screens[1].offset.1
-        );
+        //trace!(
+        //    "WRITE BG1 OFFSET Y: {}({:?})",
+        //    val,
+        //    self.bg_screens[1].offset.1
+        //);
 
         Ok(())
     }
@@ -734,11 +747,11 @@ impl Ppu {
     pub fn write_bg_2_offset_x(&mut self, val: u16) -> Result<()> {
         self.effect_bg_screens[0].bg.offset.0 = val & 0x1FF;
 
-        trace!(
-            "WRITE BG2 OFFSET X: {}({:?})",
-            val,
-            self.effect_bg_screens[0].bg.offset.0
-        );
+        //trace!(
+        //    "WRITE BG2 OFFSET X: {}({:?})",
+        //    val,
+        //    self.effect_bg_screens[0].bg.offset.0
+        //);
 
         Ok(())
     }
@@ -748,11 +761,11 @@ impl Ppu {
     pub fn write_bg_2_offset_y(&mut self, val: u16) -> Result<()> {
         self.effect_bg_screens[0].bg.offset.1 = val & 0x1FF;
 
-        trace!(
-            "WRITE BG2 OFFSET Y: {}({:?})",
-            val,
-            self.effect_bg_screens[0].bg.offset.1
-        );
+        //trace!(
+        //    "WRITE BG2 OFFSET Y: {}({:?})",
+        //    val,
+        //    self.effect_bg_screens[0].bg.offset.1
+        //);
 
         Ok(())
     }
@@ -764,11 +777,11 @@ impl Ppu {
     pub fn write_bg_3_offset_x(&mut self, val: u16) -> Result<()> {
         self.effect_bg_screens[1].bg.offset.0 = val & 0x1FF;
 
-        trace!(
-            "WRITE BG3 OFFSET X: {}({:?})",
-            val,
-            self.effect_bg_screens[1].bg.offset.0
-        );
+        //trace!(
+        //    "WRITE BG3 OFFSET X: {}({:?})",
+        //    val,
+        //    self.effect_bg_screens[1].bg.offset.0
+        //);
 
         Ok(())
     }
@@ -778,11 +791,11 @@ impl Ppu {
     pub fn write_bg_3_offset_y(&mut self, val: u16) -> Result<()> {
         self.effect_bg_screens[1].bg.offset.1 = val & 0x1FF;
 
-        trace!(
-            "WRITE BG3 OFFSET Y: {}({:?})",
-            val,
-            self.effect_bg_screens[1].bg.offset.1
-        );
+        //trace!(
+        //    "WRITE BG3 OFFSET Y: {}({:?})",
+        //    val,
+        //    self.effect_bg_screens[1].bg.offset.1
+        //);
 
         Ok(())
     }
