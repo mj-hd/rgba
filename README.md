@@ -4,4 +4,4 @@ GameBoy Advance Emulator in Rust
 
 WORK IN PROGRESS
 
-<img alt="Bokujo Monogatari" width="512" src="https://user-images.githubusercontent.com/6854255/148666646-c86f0564-d1d2-4ac2-bdc1-0522e6208f35.jpeg" />
+<img alt="Rockman EXE 3" width="512" src="https://user-images.githubusercontent.com/6854255/148784832-9025c957-2674-43e4-82cd-9498b231a293.png" />
